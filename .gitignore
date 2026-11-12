@@ -1,0 +1,12 @@
+node_modules/
+.next/
+data/
+*.tsbuildinfo
+.env*
+!.env.example
+.impeccable/review/
+.impeccable/questions/
+.impeccable/briefs/
+tmp/
+.playwright-cli/
+output/playwright/
