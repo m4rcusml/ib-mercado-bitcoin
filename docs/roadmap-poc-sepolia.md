@@ -1,8 +1,27 @@
 # Roadmap da PoC Sepolia
 
-**Status:** proposto  
+**Status:** PoC funcionando de ponta a ponta na Sepolia (16/11/2026); restam as demonstrações ao vivo de falha e os itens listados abaixo.  
 **Objetivo:** demonstrar transferências reais de Mock USDC nos dois sentidos entre a conta custodial simulada e uma embedded wallet Privy, usando Sepolia e preservando as regras do ledger.  
 **Fora do escopo:** mainnet, ativos reais, paymaster, publicação pública, integração com APIs privadas do Mercado Bitcoin e migração para PostgreSQL.
+
+## Status por fase
+
+| Fase | Status | Evidência |
+| --- | --- | --- |
+| 0 — Base verde | ✅ | 94 testes unitários sem rede, `typecheck` e `build` passando ([validation.md](validation.md)). |
+| 1 — Sepolia e contrato | ✅ | Mock USDC de 6 decimais em `0xbfc1B31e08B80383717FfB71Fc82a68c06Bb4f7d`; tesouraria com ETH e ~10.000 mUSDC; `preflight:poc` e `diagnose:sepolia` com todas as linhas `PASS`. |
+| 2 — Fluxo persistente | ✅ | Estados `processing`, `awaiting_user_signature`, `submitted`, `unknown`, `confirmed` e `failed` no SQLite; hashes únicos; liquidação protegida por status; worker de reconciliação (`POC_RECONCILE_INTERVAL_MS`, padrão 5 s) que retoma pendências após reinício; expiração com estorno (`POC_OBSERVATION_TIMEOUT_MS` 15 min, `POC_SIGNATURE_TIMEOUT_MS` 10 min). |
+| 3 — Adaptadores reais | ✅ | Coinbase Smart Account (ERC-4337, EntryPoint v0.6, dona = EOA Privy, bundler Pimlico, sem paymaster). MB → wallet (tesouraria) e wallet → MB (UserOperation assinada no navegador via `/api/rpc`) confirmados na Sepolia; UI atualizada por SSE. |
+| 4 — Integração e demo | ⏳ | Feito: `test:integration` (somente leitura por padrão), `reconcile:onchain`, docs atualizadas e [roteiro de demo](roteiro-demo.md). Falta: itens abaixo. |
+
+### Itens remanescentes
+
+- Executar ao vivo a falha controlada em cada direção e a retomada após reinício, seguindo o [roteiro de demo](roteiro-demo.md).
+- Executar a suíte de integração com escrita (`POC_INTEGRATION_WRITE=1 npm run test:integration`) e registrar o resultado em [validation.md](validation.md).
+- Abrir o PR de `feat/poc-sepolia-account-abstraction` para `main`.
+- Rotacionar as chaves usadas durante o desenvolvimento (Privy App Secret, Pimlico, Alchemy e chave da tesouraria) antes de qualquer compartilhamento do ambiente.
+
+O plano original segue abaixo, sem alterações, como referência do aceite.
 
 ## Resultado de aceite da PoC
 

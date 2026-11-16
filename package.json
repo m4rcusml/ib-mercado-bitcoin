@@ -13,7 +13,9 @@
     "test:coverage": "vitest run --coverage",
     "test:api": "node scripts/dev/check-api.mjs",
     "preflight:poc": "node scripts/poc/preflight-poc.mjs",
-    "diagnose:sepolia": "node scripts/poc/sepolia-diagnostics.mjs"
+    "diagnose:sepolia": "node scripts/poc/sepolia-diagnostics.mjs",
+    "test:integration": "vitest run --config vitest.integration.config.ts",
+    "reconcile:onchain": "node scripts/poc/reconcile-onchain.mjs"
   },
   "engines": {
     "node": ">=24.0.0"

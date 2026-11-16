@@ -127,7 +127,7 @@ Para **cunhar mais** num token já implantado, sem criar outro contrato:
 bash scripts/poc/deploy-mock-usdc.sh 5000 0xENDERECO_DO_TOKEN
 ```
 
-> Cunhe pelo menos o saldo custodial inicial da conta demo (**10.000** mUSDC). Senão, um envio MB → wallet maior que o saldo da tesouraria falha on-chain e é estornado.
+> Cunhe pelo menos o saldo custodial inicial da conta demo (**10.000** mUSDC). Senão, um envio MB → wallet maior que o saldo da tesouraria é recusado já na estimativa de gas, antes de ser transmitido, e fica *Falhou* com estorno imediato.
 
 ### 3.5 Diagnóstico on-chain
 
@@ -154,6 +154,15 @@ Em <http://127.0.0.1:3000>:
 5. **Wallet → MB:** transfira, por exemplo, 5,00 e clique em **Assinar no navegador**. A primeira UserOperation também implanta a smart account, por isso gasta mais gas. O status vai de *UserOperation enviada* para *Confirmada*.
 
 A tela se atualiza sozinha por **SSE** (`GET /api/events`) quando o worker do servidor confirma a operação.
+
+Verificação com rede (depois do teste no navegador):
+
+```bash
+npm run test:integration   # somente leitura por padrão; POC_INTEGRATION_WRITE=1 envia transações de teste
+npm run reconcile:onchain  # o ledger SQLite deve bater com os saldos on-chain
+```
+
+Para apresentar a PoC à equipe, siga o [roteiro de demonstração](roteiro-demo.md).
 
 ---
 

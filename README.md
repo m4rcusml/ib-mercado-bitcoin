@@ -82,6 +82,13 @@ npm run test:api
 
 Esse script usa contas fictícias próprias e verifica login, ida e volta, reservas, falhas, expiração, idempotência, rede e isolamento entre contas. Por padrão, acessa `http://127.0.0.1:3000`; `MB_TEST_URL` permite outra porta local. A execução desses comandos e seus resultados são informados na entrega da sessão; esta lista é o roteiro reproduzível para a equipe.
 
+Com o ambiente da PoC Sepolia configurado, há ainda duas verificações com rede:
+
+```sh
+npm run test:integration   # suíte contra a Sepolia; somente leitura por padrão (POC_INTEGRATION_WRITE=1 envia transações de teste)
+npm run reconcile:onchain  # confronta o ledger SQLite com os saldos on-chain
+```
+
 ## Integração
 
 O ponto de partida é a API da aplicação. A interface lê saldos e estados do servidor, enquanto o ledger concentra as alterações persistidas. Os valores financeiros trafegam como strings e são processados em unidades inteiras.
@@ -90,6 +97,7 @@ O ponto de partida é a API da aplicação. A interface lê saldos e estados do 
 - [Contrato da API, exemplos e pontos de substituição](docs/integration.md).
 - [Arquitetura, invariantes e plano até a PoC](docs/architecture.md).
 - [Roadmap de implementação e aceite da PoC Sepolia](docs/roadmap-poc-sepolia.md).
+- [Roteiro de demonstração da PoC Sepolia (checklist, sucesso, falhas e retomada)](docs/roteiro-demo.md).
 - [Segurança e limites do simulador](docs/security.md).
 - [Verificações executadas e limites da validação](docs/validation.md).
 - [Tipos compartilhados](src/lib/domain/contracts.ts).
