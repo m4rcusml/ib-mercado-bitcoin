@@ -1,4 +1,4 @@
-import { BridgeError } from "./money.ts";
+import { BridgeError } from "../domain/money.ts";
 
 export function assertSameOrigin(request: Request): void {
   const origin = request.headers.get("origin");
@@ -13,10 +13,18 @@ export function assertSameOrigin(request: Request): void {
 }
 
 export async function readJson(request: Request): Promise<Record<string, unknown>> {
+  const value = await readJsonValue(request, 4_096);
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    throw new BridgeError("INVALID_JSON", "Envie um objeto JSON válido.");
+  }
+  return value as Record<string, unknown>;
+}
+
+/** Lê qualquer valor JSON (objeto ou lista) limitado a `limit` bytes. */
+export async function readJsonValue(request: Request, limit: number): Promise<unknown> {
   if (request.headers.get("content-type")?.split(";")[0].trim().toLowerCase() !== "application/json") {
     throw new BridgeError("INVALID_CONTENT_TYPE", "Envie o corpo no formato application/json.", 415);
   }
-  const limit = 4_096;
   const reader = request.body?.getReader();
   if (!reader) throw new BridgeError("INVALID_JSON", "Envie um objeto JSON válido.");
   let length = 0;
@@ -27,7 +35,7 @@ export async function readJson(request: Request): Promise<Record<string, unknown
     length += chunk.value.byteLength;
     if (length > limit) {
       await reader.cancel();
-      throw new BridgeError("BODY_TOO_LARGE", "O corpo da requisição excede 4 KB.", 413);
+      throw new BridgeError("BODY_TOO_LARGE", `O corpo da requisição excede ${Math.floor(limit / 1024)} KB.`, 413);
     }
     chunks.push(chunk.value);
   }
@@ -36,11 +44,8 @@ export async function readJson(request: Request): Promise<Record<string, unknown
   for (const chunk of chunks) { bytes.set(chunk, offset); offset += chunk.byteLength; }
   let value: unknown;
   try { value = JSON.parse(new TextDecoder().decode(bytes)); }
-  catch { throw new BridgeError("INVALID_JSON", "Envie um objeto JSON válido."); }
-  if (!value || typeof value !== "object" || Array.isArray(value)) {
-    throw new BridgeError("INVALID_JSON", "Envie um objeto JSON válido.");
-  }
-  return value as Record<string, unknown>;
+  catch { throw new BridgeError("INVALID_JSON", "Envie um JSON válido."); }
+  return value;
 }
 
 export function sessionToken(request: Request): string | null {

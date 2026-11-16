@@ -1,0 +1,7 @@
+# Foundry só compila o Mock USDC de teste; não interfere no app Next.
+[profile.default]
+src = "contracts"
+out = "out-foundry"
+cache_path = "cache-foundry"
+libs = []
+solc_version = "0.8.24"
