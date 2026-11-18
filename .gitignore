@@ -10,3 +10,12 @@ data/
 tmp/
 .playwright-cli/
 output/playwright/
+
+# Foundry
+out-foundry/
+cache-foundry/
+broadcast/
+
+# Ferramentas locais (fora do projeto)
+.kiro/
+Claude outputs/
