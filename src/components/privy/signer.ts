@@ -74,14 +74,14 @@ const messages: Record<SignerErrorCode, string> = {
   no_eth: "A smart account precisa de ETH Sepolia para pagar o gas. Envie ETH de teste de um faucet para o endereço da smart account (não para a EOA Privy) e tente novamente.",
   signature_invalid: "A assinatura da UserOperation foi recusada pela smart account (AA23/AA24). Confirme que está usando a mesma conta Privy vinculada e tente novamente.",
   nonce: "O nonce da UserOperation está desatualizado (AA25), provavelmente por um envio anterior. Aguarde alguns segundos, atualize a página e tente novamente.",
-  bundler_unavailable: "O bundler ou o RPC Sepolia não respondeu. Nada foi registrado; tente novamente em instantes.",
+  bundler_unavailable: "O servidor ou o RPC Sepolia não respondeu. Atualize a atividade antes de tentar de novo.",
   proxy_unauthorized: "Sua sessão não autorizou o acesso ao RPC da aplicação (401/403). Entre novamente na conta de demonstração.",
   owner_mismatch: "A wallet Privy conectada não é a assinante (EOA) vinculada a esta conta. Entre com a mesma conta Privy usada na vinculação.",
   smart_account_mismatch: "Smart account divergente do servidor: o endereço derivado no navegador não é o vinculado à conta. Nada foi enviado.",
   no_wallet: "A embedded wallet Privy ainda não está disponível. Aguarde alguns segundos ou conecte a wallet novamente.",
   not_authenticated: "Conecte sua wallet Privy antes de assinar.",
   invalid_request: "O pedido de assinatura recebido do servidor é inválido. Nada foi enviado; atualize a página.",
-  unknown: "Não foi possível enviar a UserOperation pela smart account. Nada foi registrado; tente novamente.",
+  unknown: "Não foi possível confirmar o registro da UserOperation. Consulte a atividade antes de tentar de novo.",
 };
 
 export class SignerError extends Error {
@@ -135,8 +135,7 @@ export interface PrivySigner {
   getSmartAccountStatus(address: string): Promise<SmartAccountStatus>;
   /**
    * Monta a Coinbase Smart Account (dona = EOA Privy), confere os endereços com o servidor
-   * e envia `transfer(to, amountUnits)` como UserOperation ao bundler, sem paymaster.
-   * Devolve o `userOpHash`. Nunca espera nem confirma o receipt.
+   * e registra a UserOperation assinada para que o servidor a envie ao bundler.
    */
-  sendUserOperation(request: SignatureRequest, target: SmartAccountTarget): Promise<Hex>;
+  sendUserOperation(transferId: string, request: SignatureRequest, target: SmartAccountTarget): Promise<Hex>;
 }

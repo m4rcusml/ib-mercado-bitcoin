@@ -28,8 +28,8 @@ type RawRequest = (args: { method: string; params: unknown[] }) => Promise<unkno
  * A sessão é o cookie HttpOnly `mb_demo_session`, enviado automaticamente na mesma origem.
  * Nenhuma chave de RPC/bundler chega ao navegador.
  */
-function proxyTransport(): Transport {
-  return http(`${window.location.origin}/api/rpc`, {
+function proxyTransport(path = "/api/rpc"): Transport {
+  return http(`${window.location.origin}${path}`, {
     fetchOptions: { credentials: "same-origin", cache: "no-store" },
     retryCount: 1,
     timeout: 30_000,
@@ -67,7 +67,7 @@ async function readStatus(address: string): Promise<SmartAccountStatus> {
   } catch (error) { throw toSignerError(error); }
 }
 
-async function sendUserOperation(wallet: ConnectedWallet, request: SignatureRequest, target: SmartAccountTarget): Promise<Hex> {
+async function sendUserOperation(wallet: ConnectedWallet, transferId: string, request: SignatureRequest, target: SmartAccountTarget): Promise<Hex> {
   const { token, to, amount } = validate(request, target);
   const client = publicClient();
   if (await client.getChainId() !== SEPOLIA_CHAIN_ID) throw new SignerError("wrong_chain");
@@ -89,7 +89,7 @@ async function sendUserOperation(wallet: ConnectedWallet, request: SignatureRequ
     account,
     client,
     chain: sepolia,
-    transport: proxyTransport(),
+    transport: proxyTransport(`/api/transfers/${encodeURIComponent(transferId)}/rpc`),
     userOperation: {
       async estimateFeesPerGas({ bundlerClient: bundler }) {
         try {
@@ -104,7 +104,7 @@ async function sendUserOperation(wallet: ConnectedWallet, request: SignatureRequ
     },
   });
 
-  // 5. Envia e devolve o hash imediatamente; quem observa o receipt é o servidor.
+  // 5. O proxy persiste a operação assinada antes de devolver o hash. O worker faz a transmissão.
   const data = encodeFunctionData({ abi: erc20TransferAbi, functionName: "transfer", args: [to, amount] });
   return await bundlerClient.sendUserOperation({ calls: [{ to: token, data, value: 0n }] });
 }
@@ -130,11 +130,11 @@ function SignerBridge({ onSigner }: { onSigner: (signer: PrivySigner | null) => 
     logout: async () => { await actionsRef.current.logout(); },
     getAccessToken: () => actionsRef.current.getAccessToken(),
     getSmartAccountStatus: readStatus,
-    async sendUserOperation(request, target) {
+    async sendUserOperation(transferId, request, target) {
       if (!actionsRef.current.authenticated) throw new SignerError("not_authenticated");
       const wallet = embeddedRef.current;
       if (!wallet) throw new SignerError("no_wallet");
-      try { return await sendUserOperation(wallet, request, target); }
+      try { return await sendUserOperation(wallet, transferId, request, target); }
       catch (error) { throw toSignerError(error); }
     },
   }), [isReady, authenticated, ownerAddress]);

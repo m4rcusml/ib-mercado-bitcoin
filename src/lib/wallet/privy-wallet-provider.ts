@@ -35,6 +35,8 @@ export interface PrivyProviderDeps {
   publicClient: ReceiptReader;
   /** Bundler (Pimlico): `eth_getUserOperationReceipt`. */
   userOperations: UserOperationReader;
+  initialize?: () => Promise<void>;
+  broadcast?: (operation: PersistedOperation, signedPayload: string) => Promise<void>;
   /** Injetável em testes; padrão: `verifyTransfer` do módulo chain. */
   verify?: (client: ReceiptReader, expected: ExpectedTransfer) => Promise<VerificationResult>;
 }
@@ -76,6 +78,16 @@ export class PrivyWalletProvider implements WalletProvider {
     );
   }
 
+  async initialize(): Promise<void> {
+    await this.deps().initialize?.();
+  }
+
+  async broadcast(operation: PersistedOperation, signedPayload: string): Promise<void> {
+    const broadcast = this.deps().broadcast;
+    if (!broadcast) throw new Error("Transmissão Sepolia indisponível.");
+    await broadcast(operation, signedPayload);
+  }
+
   route(direction: Direction, walletAddress: string, amountCents: bigint): TransferRoute {
     const { treasury } = this.deps();
     if (!isAddress(walletAddress, { strict: false })) {
@@ -94,11 +106,12 @@ export class PrivyWalletProvider implements WalletProvider {
     if (!operation.toAddress || operation.amountUnits === null) {
       throw new BridgeError("INVALID_OPERATION", "Operação sem destino ou valor on-chain persistido.", 500);
     }
-    const txHash = await treasury.sendTransfer(operation.toAddress as Hex, operation.amountUnits);
-    return { status: "submitted", txHash: txHash.toLowerCase() };
+    const { txHash, signedPayload } = await treasury.prepareTransfer(operation.toAddress as Hex, operation.amountUnits);
+    return { status: "submitted", txHash: txHash.toLowerCase(), ...(signedPayload && { signedPayload }) };
   }
 
   async observe(operation: PersistedOperation): Promise<ObservationResult> {
+    await this.initialize();
     if (operation.direction === "wallet_to_mb") return this.observeUserOperation(operation);
     // Sem hash não há o que verificar; a regra de expiração do ledger decide o desfecho.
     if (!operation.txHash || !operation.fromAddress || !operation.toAddress || operation.amountUnits === null) {
@@ -196,8 +209,7 @@ export function createPrivyWalletProvider(env: NodeJS.ProcessEnv = process.env):
   // Construção preguiçosa: a configuração Sepolia só é lida na primeira operação real.
   return new PrivyWalletProvider(() => {
     const config = readSepoliaConfig(env);
-    const { publicClient, treasury, userOperations } = createSepoliaClients(config);
-    return { token: config.token, treasury, publicClient, userOperations };
+    return { token: config.token, ...createSepoliaClients(config) };
   });
 }
 

@@ -42,8 +42,8 @@ O reset local apaga só o ledger; **os saldos on-chain continuam**. Depois de ap
 Por isso, prefira **não resetar**. Se precisar:
 
 1. Pare o servidor (Ctrl+C).
-2. Faça backup: copie `data/bridge.sqlite*` para fora de `data/` (ex.: `data-backup-AAAAMMDD/`).
-3. Apague `data/bridge.sqlite`, `data/bridge.sqlite-wal` e `data/bridge.sqlite-shm`.
+2. Faça backup: copie `data/bridge-sepolia.sqlite*` para fora de `data/` (ex.: `data-backup-AAAAMMDD/`).
+3. Apague `data/bridge-sepolia.sqlite`, `data/bridge-sepolia.sqlite-wal` e `data/bridge-sepolia.sqlite-shm`.
 4. Use um **e-mail demo novo e um usuário Privy novo** (outro e-mail no login Privy): a smart account será outra, sem tokens herdados. Ela precisa receber ≥ 0,005 ETH Sepolia antes do *wallet → MB*, então faça isso na véspera, não minutos antes.
 
 ---
@@ -123,11 +123,11 @@ Não assine depois que a operação expirar: a interface não oferece mais a ass
 - `PrivyWalletProvider.submit` chama `treasury.sendTransfer`, que usa `walletClient.writeContract` do viem com conta local. O viem **estima o gas antes de assinar e transmitir** (`eth_estimateGas`).
 - Se a tesouraria não tem mUSDC suficiente, o contrato reverte com `InsufficientBalance()` já na estimativa; se não tem ETH, a estimativa ou o próprio nó recusa por fundos insuficientes; se o RPC está inacessível, a chamada HTTP falha. Em todos esses casos **a exceção ocorre antes de qualquer transmissão**.
 - `Ledger.transfer` captura a exceção ainda na mesma requisição: a operação vai **direto de `processing` para `failed`**, a reserva volta para a custódia na hora e o motivo gravado é a mensagem curta do viem, sem URLs (por exemplo `The contract function "transfer" reverted…` ou `HTTP request failed.`). Não há hash nem link de explorador, e a operação **não** fica pendurada até a expiração.
-- Caminhos diferentes, que não servem para a demo: se a transação for transmitida e **revertida on-chain**, o worker marca `failed` ("Transação revertida na rede.") e estorna; se ela for transmitida e nunca minerada, a expiração (`POC_OBSERVATION_TIMEOUT_MS`, padrão 15 min) estorna.
+- Caminhos diferentes, que não servem para a demo: se a transação for transmitida e **revertida on-chain**, o worker marca `failed` ("Transação revertida na rede.") e estorna; se ficar sem recibo, a reserva permanece e a operação passa a `unknown` após `POC_OBSERVATION_TIMEOUT_MS`.
 
-> **Não use `POC_OBSERVATION_TIMEOUT_MS` baixo para simular falha MB → wallet.** A transação da tesouraria já foi transmitida e minera em segundos; com timeout curto o ledger estorna e, logo depois, os tokens chegam à smart account. É exatamente a limitação "estorno seguido de mineração tardia" de [security.md](security.md) e deixa ledger e chain divergentes.
+> Um `POC_OBSERVATION_TIMEOUT_MS` curto demonstra o estado `unknown` enquanto o recibo está pendente. Para demonstrar estorno, use uma falha na preparação, antes de o worker transmitir.
 
-#### Opção A (recomendada): valor maior que o saldo da tesouraria
+#### Valor maior que o saldo da tesouraria
 
 Mostra uma falha "de negócio" real, sem reiniciar nada. Condição: o saldo mUSDC da tesouraria precisa ser **menor** que o disponível custodial do usuário demo (senão o ledger recusa antes, com "O valor excede o saldo disponível na origem", e nenhuma operação é criada).
 
@@ -143,28 +143,6 @@ Na demo:
 2. A resposta volta em 1–2 s com **Falhou**, motivo de revert do contrato, disponível custodial restaurado, sem link de explorador. A outra aba atualiza junto.
 
 **Dizer:** "A tesouraria não tinha saldo. O erro aconteceu na estimativa de gas, antes de assinar e transmitir: nada foi para a rede, então o estorno imediato é seguro. O total reconciliado continua 10.000,00."
-
-#### Opção B (determinística): RPC indisponível
-
-Use se não for possível preparar a margem da opção A. Exige um reinício do servidor:
-
-```powershell
-# PowerShell, no terminal do servidor (Ctrl+C antes)
-$env:ALCHEMY_RPC_URL = "https://sepolia.invalid"
-$env:POC_SIGNATURE_TIMEOUT_MS = "60000"
-npm run dev
-```
-
-O Next não sobrescreve variáveis já definidas no shell, então o `.env` fica intacto. Crie um **MB → wallet** de 5,00: o envio falha com `HTTP request failed.`, vira **Falhou** e estorna na hora. A falha 4.1 funciona nesse mesmo reinício, porque a expiração por assinatura não consulta a rede. Enquanto isso, o aviso de gas da smart account pode ficar indisponível. Depois, restaure:
-
-```powershell
-Remove-Item Env:ALCHEMY_RPC_URL; Remove-Item Env:POC_SIGNATURE_TIMEOUT_MS
-npm run dev
-```
-
-Não deixe operações `submitted` abertas antes desse reinício: sem RPC elas iriam para `unknown`.
-
----
 
 ## 5. Retomada após reinício
 
@@ -207,11 +185,10 @@ Ao final da demo, feche esse terminal ou rode `Remove-Item Env:POC_SIGNATURE_TIM
 
 **O que é simulado e o que é real?** Simulados: a conta custodial do MB (ledger SQLite), o login demo com código na tela e a tesouraria como representante do MB. Reais: o token Mock USDC na Sepolia, as transações, a smart account, a assinatura Privy e o bundler. Nada usa ativos de valor ou APIs do Mercado Bitcoin.
 
-**E se a rede ou o bundler cair?** A operação vira `unknown` e o worker continua consultando. Só a expiração explícita (`POC_OBSERVATION_TIMEOUT_MS`, padrão 15 min) estorna.
+**E se a rede ou o bundler cair?** A operação vira `unknown` e o worker continua consultando. A reserva permanece até haver evidência suficiente para liquidar ou estornar.
 
 **Limitações conhecidas** (detalhes em [security.md](security.md)):
-- Estorno por expiração seguido de mineração tardia exige reconciliação manual.
-- Queda do processo depois de a tesouraria transmitir e antes de o hash ser gravado: a operação expira com estorno embora os tokens possam ter saído; reconciliação manual.
+- Operações sem recibo podem exigir conciliação manual. O worker retoma hashes e operações assinadas que já estejam persistidos.
 - Processo único: SQLite local, barramento SSE e rate limiter em memória. Várias réplicas exigiriam PostgreSQL e pub/sub.
 - Depósitos feitos fora do app direto na smart account não são importados no ledger.
 - Login demo não é autenticação de produção.

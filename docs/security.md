@@ -47,14 +47,13 @@ Na confirmação, validar simultaneamente rede, contrato, sucesso do receipt, as
 - A EOA embedded Privy é apenas dona/assinante; o endereço operacional é a Coinbase Smart Account (EntryPoint v0.6), **derivada no servidor** pela factory on-chain a partir da EOA obtida do Privy. Nenhum endereço enviado pelo cliente é gravado.
 - `PIMLICO_API_KEY` e `ALCHEMY_RPC_URL` (que contém a chave Alchemy) são lidos somente no servidor. O browser usa `POST /api/rpc`, que nunca devolve URLs upstream nem chaves em respostas ou erros (mensagens são sanitizadas; falhas de rede viram `-32603` genérico). `scripts/poc/sepolia-diagnostics.mjs` também não imprime a chave.
 - O proxy exige sessão autenticada, mesma origem e modo privy; aceita apenas a allowlist de métodos (bundler ERC-4337 e leituras). Métodos de escrita direta (`eth_sendRawTransaction`, `eth_sendTransaction`), assinatura e depuração (`debug_*`) respondem `-32601`. Corpo limitado a 64 KB, lote a 20 itens e 240 chamadas/minuto por conta (memória do processo; reinicia com o servidor).
-- `eth_sendUserOperation` e `eth_estimateUserOperationGas` só são encaminhados quando `sender` é a smart account vinculada à sessão e o EntryPoint é o v0.6 (`SMART_ACCOUNT_MISMATCH` caso contrário), impedindo o uso do proxy como bundler gratuito para terceiros.
+- O proxy verifica se o `sender` corresponde à smart account da sessão e se o EntryPoint é v0.6. Para `eth_sendUserOperation`, o endpoint da transferência também verifica o calldata esperado, calcula o hash e persiste a operação assinada antes de o worker enviá-la.
 - Leituras (`eth_call`, `eth_getBalance` etc.) aceitam qualquer endereço Sepolia: consomem cota do Alchemy, limitada pelo rate limit, mas não alteram estado.
-- O `userOpHash` informado pelo browser é só um ponteiro: a liquidação exige receipt do bundler com `sender` correto e `success`, o `Transfer` exato entre os logs da própria UserOperation (evita reaproveitar o `Transfer` de outra UserOperation do mesmo bundle) e verificação independente da transação do bundle via RPC. `user_op_hash` é único no banco.
+- O `userOpHash` calculado no servidor identifica a operação: a liquidação exige receipt do bundler com `sender` correto e `success`, o `Transfer` exato entre os logs da própria UserOperation (evita reaproveitar o `Transfer` de outra UserOperation do mesmo bundle) e verificação independente da transação do bundle via RPC. `user_op_hash` é único no banco.
 
 ### Limitações conhecidas (reconciliação manual)
 
-1. **Estorno seguido de mineração tardia.** Se uma operação expira (`POC_OBSERVATION_TIMEOUT_MS`, ex.: RPC/bundler indisponível por mais de 15 minutos, ou UserOperation presa no mempool) e a reserva é devolvida, a transação ou UserOperation ainda pode ser incluída depois. O ledger não reabre operações `failed`: o saldo lógico e o on-chain divergem e a correção é manual (conferir o `txHash`/`userOpHash` no explorer e ajustar).
-2. **Queda após a transmissão da tesouraria e antes de persistir o hash.** Se o processo cair entre o envio de `MockUSDC.transfer` pela tesouraria e a gravação do `txHash`, a operação fica sem evidência e expira com estorno, embora os tokens possam ter sido enviados. Antes de repetir, confira as transações recentes da tesouraria e reconcilie manualmente.
+Uma operação sem recibo pode permanecer em `unknown` com a reserva mantida. Verifique o hash na rede antes de qualquer ajuste manual. Em bancos Privy antigos, operações abertas sem hash também podem exigir conciliação.
 
 ## Persistência local
 

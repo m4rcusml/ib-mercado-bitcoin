@@ -202,4 +202,4 @@ tests/                  espelha src/lib (domain, wallet, chain, server)
 data/                   SQLite local (ignorado pelo Git)
 ```
 
-Para resetar o estado local, pare o servidor e apague `data/bridge.sqlite*`. Os tokens já movimentados na Sepolia continuam on-chain.
+O modo Privy usa `data/bridge-sepolia.sqlite` e verifica a rede, o bytecode e os decimais no boot. Para abrir um banco Privy anterior, configure `MB_DATABASE_PATH` para o arquivo existente. Bancos com dados de ambos os modos exigem reconciliação antes da migração.

@@ -113,7 +113,8 @@ Parâmetros opcionais (milissegundos):
 | --- | --- | --- |
 | `POST /api/wallet/link` | `{"privyAccessToken":"<token do SDK Privy>"}` | O servidor valida o token (`PrivyClient.verifyAuthToken`), obtém a EOA embedded (`linkedAccounts` com `type: "wallet"` e `walletClientType: "privy"`), **deriva a smart account** pela factory on-chain e grava ambas. Nenhum endereço do cliente é aceito. Erros: `INVALID_PRIVY_TOKEN` (400/401), `EMBEDDED_WALLET_NOT_FOUND` (409), `WALLET_ALREADY_LINKED` (409), `PENDING_TRANSACTION` (409), `SMART_ACCOUNT_UNAVAILABLE` (502), `MISSING_CONFIG` (503). No modo simulado: `409 PRIVY_DISABLED`. |
 | `POST /api/transfers` | `{"direction":"mb_to_wallet","amount":"12.50"}` | Igual ao modo simulado, mas `outcome` é recusado (`400 SIMULATION_DISABLED`) e exige wallet vinculada (`409 WALLET_INACTIVE`). `mb_to_wallet`: a tesouraria envia `MockUSDC.transfer(smartAccount, unidades)` e a operação volta `submitted` com `txHash`. `wallet_to_mb`: volta `awaiting_user_signature` com `signatureRequest`. |
-| `POST /api/transfers/{id}/submission` | `{"userOpHash":"0x…64 hex"}` | Vincula o hash da UserOperation: `awaiting_user_signature` → `submitted`. Exige sessão e que a operação (`wallet_to_mb`) pertença à conta. Reenviar o mesmo hash é idempotente. O corpo antigo `{"txHash":…}` não é mais aceito. Erros: `INVALID_USER_OP_HASH` (400), `TRANSFER_NOT_FOUND` (404), `INVALID_TRANSFER_STATUS` (409), `DUPLICATE_USER_OP_HASH` (409). **Não liquida saldo.** |
+| `POST /api/transfers/{id}/rpc` | JSON-RPC `eth_sendUserOperation` | Valida e registra a operação assinada e devolve seu hash. O worker transmite e observa. |
+| `POST /api/transfers/{id}/submission` | `{"userOpHash":"0x…64 hex"}` | Recupera o hash de uma operação legada. Repetir um hash já associado é idempotente. |
 | `POST /api/rpc` | Request JSON-RPC 2.0 ou lote (até 20) | Proxy do browser para bundler/RPC; ver abaixo. |
 | `POST /api/reconciliation/advance` | — | Observa as operações pendentes da conta e devolve `BridgeState`. Disponível nos dois modos. |
 | `POST /api/wallet/activate` | — | No modo privy: `409 WALLET_LINK_REQUIRED`, apontando para `/api/wallet/link`. |
@@ -124,10 +125,10 @@ Parâmetros opcionais (milissegundos):
 Permite ao browser usar `http("/api/rpc")` como transporte do viem (public client e bundler client) sem conhecer `PIMLICO_API_KEY` nem `ALCHEMY_RPC_URL`.
 
 - Exige sessão (`mb_demo_session`, mesmo cookie das demais rotas; `401 UNAUTHORIZED`), mesma origem e `WALLET_PROVIDER=privy` (`409 PRIVY_DISABLED`). Corpo `application/json` de no máximo 64 KB (`413 BODY_TOO_LARGE`). Até 240 chamadas por minuto por conta, contando cada item de lote (`429 RATE_LIMITED`). Configuração ausente: `503 MISSING_CONFIG`.
-- Métodos encaminhados ao **Pimlico** (Sepolia): `eth_sendUserOperation`, `eth_estimateUserOperationGas`, `eth_getUserOperationReceipt`, `eth_getUserOperationByHash`, `eth_supportedEntryPoints`, `pimlico_getUserOperationGasPrice`.
+- Métodos encaminhados ao **Pimlico** (Sepolia): `eth_estimateUserOperationGas`, `eth_getUserOperationReceipt`, `eth_getUserOperationByHash`, `eth_supportedEntryPoints`, `pimlico_getUserOperationGasPrice`.
 - Métodos encaminhados ao **Alchemy** (Sepolia): `eth_chainId`, `eth_call`, `eth_getCode`, `eth_getBalance`, `eth_blockNumber`, `eth_estimateGas`, `eth_gasPrice`, `eth_maxPriorityFeePerGas`, `eth_feeHistory`, `eth_getTransactionCount`, `eth_getBlockByNumber`, `eth_getTransactionReceipt`.
 - Qualquer outro método (ex.: `eth_sendRawTransaction`, `debug_*`) responde erro JSON-RPC `-32601`. Request malformado: `-32600`; `params` que não seja lista: `-32602`.
-- `eth_sendUserOperation` e `eth_estimateUserOperationGas` exigem `params[0].sender` igual à smart account vinculada à sessão e `params[1]` igual ao EntryPoint v0.6; caso contrário respondem `{"code":-32602,"message":"SMART_ACCOUNT_MISMATCH: …","data":{"code":"SMART_ACCOUNT_MISMATCH"}}` sem chamar o bundler.
+- `eth_sendUserOperation` e `eth_estimateUserOperationGas` exigem `params[0].sender` igual à smart account vinculada à sessão e `params[1]` igual ao EntryPoint v0.6; caso contrário respondem `{"code":-32602,"message":"SMART_ACCOUNT_MISMATCH: …","data":{"code":"SMART_ACCOUNT_MISMATCH"}}` sem chamar o bundler. O envio só pode ser registrado no endpoint da transferência, que também valida o calldata.
 - Erros JSON-RPC do upstream são repassados (código, mensagem e `data`) sem URLs; falha de rede/timeout vira `-32603` genérico. O `id` do cliente é preservado. Respostas JSON-RPC usam HTTP 200; erros de sessão/configuração usam o formato `{"error":{"code","message"}}` com o status HTTP indicado.
 
 ### Contrato JSON no modo privy
@@ -178,28 +179,23 @@ const state = await (await fetch('/api/transfers', {
 })).json();
 const tx = state.transactions[0];
 const { token, to, amountUnits, smartAccount } = tx.signatureRequest;
-// publicClient/bundlerClient com transport http('/api/rpc'); account = toCoinbaseSmartAccount({ client, owners: [eoaPrivy], version: '1' })
-// confira account.address === smartAccount antes de assinar
-// userOpHash = await bundlerClient.sendUserOperation({ account, calls: [{ to: token, data: encodeFunctionData({ abi: erc20Abi, functionName: 'transfer', args: [to, BigInt(amountUnits)] }) }] })
-await fetch(`/api/transfers/${tx.id}/submission`, {
-  method: 'POST',
-  headers: { 'Content-Type': 'application/json' },
-  body: JSON.stringify({ userOpHash }),
-});
-// Depois, consulte /api/reconciliation/advance (ou /api/state) até `confirmed`/`failed`.
+// Use http('/api/rpc') no publicClient e http(`/api/transfers/${tx.id}/rpc`) no bundlerClient.
+// Derive a Coinbase Smart Account com a EOA Privy e confira account.address === smartAccount.
+// Use bundlerClient.sendUserOperation({ account, calls: [...] }) para assinar o transfer.
+// O endpoint devolve o hash após gravar a operação assinada. Acompanhe o estado por SSE.
 ```
 
-Se o envio do hash falhar por rede, reenvie o mesmo `userOpHash`: a rota é idempotente. Se o usuário recusar a assinatura, a operação expira após `POC_SIGNATURE_TIMEOUT_MS` e a reserva volta à wallet. A smart account precisa de ETH Sepolia para pagar o gas (inclusive o deploy na primeira UserOperation).
+A assinatura precisa chegar ao servidor antes de `POC_SIGNATURE_TIMEOUT_MS`. A smart account usa ETH Sepolia para pagar o gas, inclusive no primeiro deploy.
 
 ### Observação, expiração e retomada
 
-- Envio e observação nunca ocorrem dentro de uma transação SQLite: reserva → commit → chamada de rede → persistência.
+- O servidor calcula o hash e persiste a operação assinada antes de transmitir. Uma resposta ambígua mantém a reserva e permite retentar a mesma operação.
 - `mb_to_wallet`: `verifyTransfer` com `chainId` 11155111, contrato Mock USDC, origem (tesouraria), destino (smart account) e unidades persistidos na reserva.
 - `wallet_to_mb`: `eth_getUserOperationReceipt(userOpHash)` no bundler. Ausente ⇒ continua `submitted`. `sender` diferente da smart account ou EntryPoint diferente do v0.6 ⇒ `failed`. `success: false` ⇒ `failed` ("UserOperation revertida no EntryPoint."). O `Transfer` esperado precisa constar nos logs da própria UserOperation; em seguida `verifyTransfer` independente (Alchemy) sobre a transação do bundle, cujo hash é persistido em `txHash`.
 - Resultado `pending` mantém `submitted` (nova consulta após ~3 s). Erro de RPC/bundler marca `unknown` e mantém a reserva.
 - A liquidação é um único `UPDATE` protegido pelo status atual; o saldo só se move quando esse `UPDATE` altera exatamente uma linha. Observações simultâneas da mesma operação no mesmo processo são evitadas.
 - `user_op_hash` é único (índice parcial); `tx_hash` é único apenas para envios diretos da tesouraria, pois um bundle pode carregar várias UserOperations.
-- Expiração explícita e auditável: `submitted`/`unknown` além de `POC_OBSERVATION_TIMEOUT_MS` e `awaiting_user_signature` além de `POC_SIGNATURE_TIMEOUT_MS` viram `failed` com estorno e motivo em `failureReason`. Antes de expirar uma operação com hash, uma última observação é feita; se ela confirmar, a operação é confirmada. Uma operação interrompida antes de persistir o hash (queda do processo durante o envio da tesouraria) também expira com estorno após `POC_OBSERVATION_TIMEOUT_MS`.
+- Sem recibo após `POC_OBSERVATION_TIMEOUT_MS`, o status fica `unknown` e o worker continua observando. Uma assinatura que não chega dentro de `POC_SIGNATURE_TIMEOUT_MS` estorna a reserva antes de qualquer envio.
 - `reconcileAll()` processa as pendências de todas as contas; no modo privy, um worker em segundo plano o executa no boot e a cada `POC_RECONCILE_INTERVAL_MS`, retomando operações persistidas antes de um reinício.
 - Mensagens de erro de RPC/bundler são reduzidas antes de persistir/expor; URLs (que podem conter chave de API) são omitidas.
 
@@ -214,6 +210,6 @@ Se o envio do hash falhar por rede, reenvie o mesmo `userOpHash`: a rota é idem
 
 ### Limitações conhecidas da PoC
 
-Ver [segurança](security.md#limitações-conhecidas-reconciliação-manual): estorno seguido de mineração tardia e queda do processo após a transmissão da tesouraria exigem reconciliação manual. Instância única com SQLite; múltiplas réplicas exigiriam lock distribuído e PostgreSQL.
+Operações sem recibo podem exigir [reconciliação manual](security.md#limitações-conhecidas-reconciliação-manual). A PoC usa uma única instância com SQLite.
 
 Os pontos de código são `src/lib/wallet/wallet-provider.ts` (contrato do provider e modo simulado), `src/lib/wallet/privy-wallet-provider.ts` (tesouraria, observação e vinculação Privy), `src/lib/chain/` (viem; `smart-account.ts` deriva a smart account e lê receipts de UserOperation), `src/lib/server/rpc-proxy.ts` (proxy JSON-RPC), `src/lib/domain/ledger.ts` (estados, reserva, liquidação, worker) e `src/app/api/[...path]/route.ts` (rotas).

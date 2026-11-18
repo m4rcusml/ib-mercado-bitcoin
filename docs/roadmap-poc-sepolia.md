@@ -10,7 +10,7 @@
 | --- | --- | --- |
 | 0 — Base verde | ✅ | 94 testes unitários sem rede, `typecheck` e `build` passando ([validation.md](validation.md)). |
 | 1 — Sepolia e contrato | ✅ | Mock USDC de 6 decimais em `0xbfc1B31e08B80383717FfB71Fc82a68c06Bb4f7d`; tesouraria com ETH e ~10.000 mUSDC; `preflight:poc` e `diagnose:sepolia` com todas as linhas `PASS`. |
-| 2 — Fluxo persistente | ✅ | Estados `processing`, `awaiting_user_signature`, `submitted`, `unknown`, `confirmed` e `failed` no SQLite; hashes únicos; liquidação protegida por status; worker de reconciliação (`POC_RECONCILE_INTERVAL_MS`, padrão 5 s) que retoma pendências após reinício; expiração com estorno (`POC_OBSERVATION_TIMEOUT_MS` 15 min, `POC_SIGNATURE_TIMEOUT_MS` 10 min). |
+| 2 — Fluxo persistente | ✅ | Estados `processing`, `awaiting_user_signature`, `submitted`, `unknown`, `confirmed` e `failed` no SQLite; hashes únicos; liquidação protegida por status; worker de reconciliação (`POC_RECONCILE_INTERVAL_MS`, padrão 5 s) que retoma pendências após reinício; persistência antes da transmissão, observação contínua após timeout e estorno se a assinatura não chegar no prazo. |
 | 3 — Adaptadores reais | ✅ | Coinbase Smart Account (ERC-4337, EntryPoint v0.6, dona = EOA Privy, bundler Pimlico, sem paymaster). MB → wallet (tesouraria) e wallet → MB (UserOperation assinada no navegador via `/api/rpc`) confirmados na Sepolia; UI atualizada por SSE. |
 | 4 — Integração e demo | ⏳ | Feito: `test:integration` (somente leitura por padrão), `reconcile:onchain`, docs atualizadas e [roteiro de demo](roteiro-demo.md). Falta: itens abaixo. |
 
@@ -35,7 +35,7 @@ O demo deve apresentar pelo menos um sucesso e uma falha ou expiração controla
 2. **A tesouraria é uma identidade técnica separada e somente do servidor.** Ela assina `mb_to_wallet` em Sepolia; sua chave fica em gestão de segredos e nunca chega ao browser.
 3. **A reserva é persistida antes do envio, mas o envio não ocorre dentro de uma transação SQLite.** Isso evita manter lock de banco durante RPC/bundler e permite recuperar operações após queda.
 4. **Um hash comunicado pelo cliente não liquida saldo.** Ele apenas vincula a operação ao observador; a liquidação exige receipt, rede, contrato, evento, remetente, destinatário e valor validados no servidor.
-5. **O timeout da PoC deve virar `unknown` antes de qualquer estorno automático.** O worker continua consultando a rede; somente uma regra explícita de expiração, demonstrada e auditável, pode decidir o desfecho financeiro.
+5. **Um timeout após o registro do envio mantém a reserva em `unknown`.** O worker continua consultando a rede. O estorno exige falha comprovada ou expiração antes de qualquer transmissão.
 
 ## Fase 0 — Recuperar uma base verde
 

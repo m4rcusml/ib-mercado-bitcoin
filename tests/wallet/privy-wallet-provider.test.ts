@@ -54,7 +54,7 @@ function makeProvider(
   verifyResult: VerificationResult | Error = { status: "confirmed", blockNumber: 1n },
   receipt: UserOperationReceiptLike | null | Error = null,
 ) {
-  const sendTransfer = vi.fn(async (_to: Hex, _units: bigint): Promise<Hex> => TX);
+  const prepareTransfer = vi.fn(async (_to: Hex, _units: bigint) => ({ txHash: TX }));
   const verify = vi.fn(async (_client: unknown, _expected: ExpectedTransfer): Promise<VerificationResult> => {
     if (verifyResult instanceof Error) throw verifyResult;
     return verifyResult;
@@ -65,12 +65,12 @@ function makeProvider(
   });
   const provider = new PrivyWalletProvider({
     token: TOKEN,
-    treasury: { address: TREASURY, sendTransfer },
+    treasury: { address: TREASURY, prepareTransfer },
     publicClient: {} as never,
     userOperations: { getUserOperationReceipt },
     verify,
   });
-  return { provider, sendTransfer, verify, getUserOperationReceipt };
+  return { provider, prepareTransfer, verify, getUserOperationReceipt };
 }
 
 function operation(overrides: Partial<PersistedOperation> = {}): PersistedOperation {
@@ -96,18 +96,18 @@ test("route fixa origem, destino e unidades de 6 decimais em cada sentido", () =
 
 test("mb_to_wallet: submit envia pela tesouraria e devolve o hash sem aguardar", async () => {
   const fetchMock = blockNetwork();
-  const { provider, sendTransfer } = makeProvider();
+  const { provider, prepareTransfer } = makeProvider();
   const result = await provider.submit(operation({ status: "processing", txHash: null }));
   assert.deepEqual(result, { status: "submitted", txHash: TX });
-  assert.deepEqual(sendTransfer.mock.calls, [[USER, 12_500_000n]]);
+  assert.deepEqual(prepareTransfer.mock.calls, [[USER, 12_500_000n]]);
   assert.equal(fetchMock.mock.calls.length, 0);
 });
 
 test("wallet_to_mb: submit não envia nada e pede assinatura do usuário", async () => {
-  const { provider, sendTransfer } = makeProvider();
+  const { provider, prepareTransfer } = makeProvider();
   const op = operation({ direction: "wallet_to_mb", status: "awaiting_user_signature", fromAddress: USER, toAddress: TREASURY, txHash: null });
   assert.deepEqual(await provider.submit(op), { status: "awaiting_user_signature" });
-  assert.equal(sendTransfer.mock.calls.length, 0);
+  assert.equal(prepareTransfer.mock.calls.length, 0);
   assert.deepEqual(provider.signatureRequest(op), {
     chainId: 11155111, token: TOKEN, to: TREASURY, amountUnits: "12500000", smartAccount: USER, ownerAddress: OWNER, entryPoint: "0.6",
   });

@@ -5,9 +5,9 @@ export type SimulationOutcome = "confirmed" | "failed" | "timeout";
 export type ProviderMode = "simulated" | "privy";
 /**
  * - `processing`: modo simulado, reserva feita e aguardando a janela de simulação.
- * - `awaiting_user_signature`: modo privy, `wallet_to_mb` reservado aguardando o `userOpHash` da UserOperation assinada no browser.
- * - `submitted`: hash registrado (tx da tesouraria ou `userOpHash`); aguardando verificação independente.
- * - `unknown`: a observação falhou temporariamente; a reserva é mantida.
+ * - `awaiting_user_signature`: modo privy, `wallet_to_mb` reservado aguardando a UserOperation assinada no browser.
+ * - `submitted`: envio registrado e aguardando verificação independente.
+ * - `unknown`: transmissão pendente ou observação inconclusiva. A reserva é mantida.
  * - `confirmed` / `failed`: estados finais.
  */
 export type TransactionStatus =

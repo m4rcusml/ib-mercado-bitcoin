@@ -13,7 +13,7 @@
 //   transitória: a rede já liquidou e o observador ainda não. Elas são sinalizadas na linha da conta.
 //
 // Ambiente: ambiente > .env.local > .env (sem sobrescrever, sem imprimir valores). Banco:
-// MB_DATABASE_PATH ou data/bridge.sqlite, aberto em modo somente leitura. Nunca imprime segredos
+// MB_DATABASE_PATH ou data/bridge-sepolia.sqlite, aberto em modo somente leitura. Nunca imprime segredos
 // nem URLs do RPC; e-mails saem mascarados.
 import { existsSync } from "node:fs";
 import { resolve } from "node:path";
@@ -79,9 +79,9 @@ async function main() {
     return 2;
   }
 
-  const dbPath = process.env.MB_DATABASE_PATH?.trim() ? resolve(process.env.MB_DATABASE_PATH.trim()) : resolve(ROOT, "data/bridge.sqlite");
+  const dbPath = process.env.MB_DATABASE_PATH?.trim() ? resolve(process.env.MB_DATABASE_PATH.trim()) : resolve(ROOT, "data/bridge-sepolia.sqlite");
   if (!existsSync(dbPath)) {
-    console.log("FAIL  banco SQLite não encontrado (MB_DATABASE_PATH ou data/bridge.sqlite).");
+    console.log("FAIL  banco SQLite não encontrado (MB_DATABASE_PATH ou data/bridge-sepolia.sqlite).");
     return 2;
   }
   const db = new DatabaseSync(dbPath, { readOnly: true });

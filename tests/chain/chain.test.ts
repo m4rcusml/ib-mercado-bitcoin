@@ -1,6 +1,8 @@
 import { describe, expect, it } from "vitest";
 import {
   TransactionReceiptNotFoundError,
+  createPublicClient,
+  custom,
   decodeFunctionData,
   encodeAbiParameters,
   encodeEventTopics,
@@ -15,6 +17,7 @@ import {
   pimlicoBundlerUrl,
   readRpcUpstreams,
   readSepoliaConfig,
+  validateSepolia,
   verifyTransfer,
   type ExpectedTransfer,
   type ReceiptReader,
@@ -27,6 +30,23 @@ const FROM = "0x2222222222222222222222222222222222222222" as const;
 const TO = "0x3333333333333333333333333333333333333333" as const;
 const STRANGER = "0x4444444444444444444444444444444444444444" as const;
 const HASH = `0x${"ab".repeat(32)}` as const;
+
+it("valida rede, bytecode e decimais do contrato antes do uso", async () => {
+  function client(chainId: number, code: string, decimals: number) {
+    return createPublicClient({ transport: custom({
+      async request({ method }) {
+        if (method === "eth_chainId") return `0x${chainId.toString(16)}`;
+        if (method === "eth_getCode") return code;
+        if (method === "eth_call") return encodeAbiParameters([{ type: "uint8" }], [decimals]);
+        throw new Error("Método inesperado");
+      },
+    }, { retryCount: 0 }) });
+  }
+  await expect(validateSepolia(client(SEPOLIA, "0x60", 6), TOKEN)).resolves.toBeUndefined();
+  await expect(validateSepolia(client(1, "0x60", 6), TOKEN)).rejects.toMatchObject({ code: "INVALID_SEPOLIA_CONFIG" });
+  await expect(validateSepolia(client(SEPOLIA, "0x", 6), TOKEN)).rejects.toMatchObject({ code: "INVALID_SEPOLIA_CONFIG" });
+  await expect(validateSepolia(client(SEPOLIA, "0x60", 18), TOKEN)).rejects.toMatchObject({ code: "INVALID_SEPOLIA_CONFIG" });
+});
 
 type Receipt = Awaited<ReturnType<ReceiptReader["getTransactionReceipt"]>>;
 type Log = Receipt["logs"][number];
@@ -160,22 +180,22 @@ describe("mock-usdc helpers", () => {
 });
 
 describe("createTreasurySender", () => {
-  it("envia transfer do token e devolve o hash sem aguardar", async () => {
+  it("prepara o transfer do token e devolve o hash", async () => {
     const calls: unknown[] = [];
     const sender = createTreasurySender({
       token: TOKEN,
       walletClient: {
         account: { address: FROM },
-        writeContract: async (args) => {
+        signTransfer: async (args) => {
           calls.push(args);
-          return HASH;
+          return { txHash: HASH };
         },
       },
     });
     expect(sender.address).toBe(FROM);
-    await expect(sender.sendTransfer(TO, 10n)).resolves.toBe(HASH);
+    await expect(sender.prepareTransfer(TO, 10n)).resolves.toEqual({ txHash: HASH });
     expect(calls).toEqual([{ address: TOKEN, abi: mockUsdcAbi, functionName: "transfer", args: [TO, 10n] }]);
-    await expect(sender.sendTransfer(TO, 0n)).rejects.toThrow();
+    await expect(sender.prepareTransfer(TO, 0n)).rejects.toThrow();
   });
 });
 

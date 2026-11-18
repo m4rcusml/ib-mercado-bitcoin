@@ -22,13 +22,14 @@ const HASH_32 = /^0x[0-9a-fA-F]{64}$/;
 const ADDRESS = /^0x[0-9a-fA-F]{40}$/;
 const OPEN_STATUSES = "('processing', 'awaiting_user_signature', 'submitted', 'unknown')";
 const OBSERVABLE_STATUSES = ["processing", "submitted", "unknown"] as const;
+const DURABLE_PENDING_PREFIX = "durable_";
 
 type Row = Record<string, string | bigint | null>;
 
 export interface LedgerOptions {
   /** App ID público do Privy exposto no estado (nunca o segredo). */
   privyAppId?: string | null;
-  /** submitted/unknown mais antigos que isso (desde o envio) viram failed com estorno. */
+  /** Depois deste prazo, um envio sem recibo continua em observação com status unknown. */
   observationTimeoutMs?: number;
   /** awaiting_user_signature mais antigo que isso (desde a criação) vira failed com estorno. */
   signatureTimeoutMs?: number;
@@ -55,12 +56,13 @@ const TRANSFERS_COLUMNS = `
   to_address TEXT,
   amount_units INTEGER CHECK(amount_units IS NULL OR amount_units > 0),
   submitted_at INTEGER,
+  signed_payload TEXT,
   UNIQUE(account_id, idempotency_key)
 `;
 const TRANSFER_COLUMN_NAMES = [
   "id", "account_id", "direction", "amount_cents", "status", "outcome", "simulation_id", "hash", "user_op_hash",
   "failure_reason", "created_at", "settles_at", "settled_at", "idempotency_key", "tx_hash", "wallet_address",
-  "from_address", "to_address", "amount_units", "submitted_at",
+  "from_address", "to_address", "amount_units", "submitted_at", "signed_payload",
 ];
 
 export function normalizeEmail(value: unknown): string {
@@ -153,11 +155,38 @@ export class Ledger {
       CREATE TABLE IF NOT EXISTS transfers (${TRANSFERS_COLUMNS});
       CREATE INDEX IF NOT EXISTS transfers_account_created ON transfers(account_id, created_at DESC);
     `);
-    this.migrate();
+    try {
+      this.migrate();
+      this.bindDatabaseMode();
+    } catch (error) {
+      this.db.close();
+      throw error;
+    }
+  }
+
+  private bindDatabaseMode(): void {
+    this.atomic(() => {
+      this.db.exec("CREATE TABLE IF NOT EXISTS ledger_mode (id INTEGER PRIMARY KEY CHECK(id = 1), mode TEXT NOT NULL)");
+      const saved = this.statement("SELECT mode FROM ledger_mode WHERE id = 1").get() as Row | undefined;
+      if (!saved) {
+        const real = this.statement("SELECT 1 FROM accounts WHERE owner_address IS NOT NULL UNION ALL SELECT 1 FROM transfers WHERE amount_units IS NOT NULL LIMIT 1").get();
+        const simulated = this.statement("SELECT 1 FROM transfers WHERE amount_units IS NULL LIMIT 1").get();
+        if ((real && simulated) || (real && this.mode !== "privy") || (simulated && this.mode !== "simulated")) {
+          throw new BridgeError("LEDGER_MODE_MISMATCH", "O SQLite contém operações incompatíveis com o modo da wallet. Configure um banco exclusivo para este modo.", 503);
+        }
+        this.statement("INSERT INTO ledger_mode (id, mode) VALUES (1, ?)").run(this.mode);
+      } else if (saved.mode !== this.mode) {
+        throw new BridgeError("LEDGER_MODE_MISMATCH", "O SQLite pertence a outro modo da wallet. Configure um banco exclusivo para este modo.", 503);
+      }
+    });
   }
 
   get mode(): ProviderMode {
     return this.provider.mode;
+  }
+
+  async initialize(): Promise<void> {
+    await this.provider.initialize?.();
   }
 
   /**
@@ -374,6 +403,7 @@ export class Ledger {
       throw new BridgeError("INVALID_OUTCOME", "Escolha um cenário simulado válido.");
     }
     const amount = parseAmount(input.amount);
+    await this.provider.initialize?.();
     const reserved = this.atomic(() => {
       const account = this.account(accountId);
       const existing = this.statement("SELECT * FROM transfers WHERE account_id = ? AND idempotency_key = ?")
@@ -383,6 +413,11 @@ export class Ledger {
           throw new BridgeError("IDEMPOTENCY_CONFLICT", "Esta chave já foi usada para outra transferência. Use uma nova chave.", 409);
         }
         return this.state(accountId);
+      }
+      if (direction === "mb_to_wallet" && this.provider.broadcast && this.statement(
+        "SELECT 1 FROM transfers WHERE direction = 'mb_to_wallet' AND (status = 'processing' OR signed_payload IS NOT NULL) LIMIT 1",
+      ).get()) {
+        throw new BridgeError("TREASURY_BUSY", "A tesouraria está concluindo um envio. Aguarde a atualização e tente novamente.", 409);
       }
       if (!account.wallet_address || (this.provider.mode === "privy" && !account.owner_address)) {
         throw this.provider.mode === "privy"
@@ -404,7 +439,7 @@ export class Ledger {
       this.statement(`INSERT INTO transfers(id, account_id, direction, amount_cents, status, outcome, simulation_id, created_at, settles_at, idempotency_key,
           wallet_address, from_address, to_address, amount_units)
         VALUES (?, ?, ?, ?, 'processing', ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
-        .run(transferId, accountId, direction, amount.cents, outcome, `pending_${transferId}`, BigInt(now), PENDING_SETTLES_AT, key,
+        .run(transferId, accountId, direction, amount.cents, outcome, `${this.mode === "privy" ? DURABLE_PENDING_PREFIX : "pending_"}${transferId}`, BigInt(now), PENDING_SETTLES_AT, key,
           account.wallet_address, route.from, route.to, route.amountUnits);
       return { transferId, source, reservedColumn };
     });
@@ -417,7 +452,7 @@ export class Ledger {
     try {
       submitted = await this.provider.submit(operation, now);
     } catch (error) {
-      if (!(error instanceof BridgeError)) console.error("Falha ao enviar operação", operation.id, error);
+      if (!(error instanceof BridgeError)) console.error("Falha ao preparar operação", operation.id);
       return this.atomic(() => {
         const pending = this.statement("SELECT status FROM transfers WHERE id = ?").get(reserved.transferId) as Row | undefined;
         if (pending?.status === "processing") {
@@ -435,8 +470,8 @@ export class Ledger {
         this.statement("UPDATE transfers SET simulation_id = ?, user_op_hash = ?, settles_at = ? WHERE id = ? AND status = 'processing'")
           .run(submitted.simulationId, submitted.userOpHash, BigInt(submitted.settlesAt), reserved.transferId);
       } else if (submitted.status === "submitted") {
-        this.statement("UPDATE transfers SET status = 'submitted', tx_hash = ?, submitted_at = ?, settles_at = ? WHERE id = ? AND status = 'processing'")
-          .run(submitted.txHash.toLowerCase(), BigInt(now), BigInt(now), reserved.transferId);
+        this.statement("UPDATE transfers SET status = ?, tx_hash = ?, signed_payload = ?, submitted_at = ?, settles_at = ? WHERE id = ? AND status = 'processing'")
+          .run(submitted.signedPayload ? "unknown" : "submitted", submitted.txHash.toLowerCase(), submitted.signedPayload ?? null, BigInt(now), BigInt(now), reserved.transferId);
       } else {
         this.statement("UPDATE transfers SET status = 'awaiting_user_signature' WHERE id = ? AND status = 'processing'")
           .run(reserved.transferId);
@@ -449,7 +484,7 @@ export class Ledger {
    * Vincula o `userOpHash` informado pelo browser a uma operação `wallet_to_mb`. Não liquida saldo:
    * somente o observador, após o receipt do bundler e a verificação on-chain, confirma a operação.
    */
-  submitUserOperation(accountId: string, transferId: unknown, userOpHashValue: unknown, now = Date.now()): BridgeState {
+  submitUserOperation(accountId: string, transferId: unknown, userOpHashValue: unknown, now = Date.now(), signedPayload?: string, legacyOnly = false): BridgeState {
     if (typeof transferId !== "string" || transferId.length > 64) {
       throw new BridgeError("TRANSFER_NOT_FOUND", "Transferência não encontrada.", 404);
     }
@@ -463,14 +498,22 @@ export class Ledger {
       if (!row) throw new BridgeError("TRANSFER_NOT_FOUND", "Transferência não encontrada.", 404);
       // Reenvio do mesmo hash após uma falha de rede no cliente é idempotente.
       if (row.user_op_hash === userOpHash) return this.state(accountId);
-      if (row.direction !== "wallet_to_mb" || row.status !== "awaiting_user_signature") {
+      const durable = String(row.simulation_id).startsWith(DURABLE_PENDING_PREFIX);
+      if (legacyOnly && durable) {
+        throw new BridgeError("SIGNED_USER_OPERATION_REQUIRED", "Envie a UserOperation assinada pelo endpoint RPC da transferência.", 409);
+      }
+      const awaitingLegacyHash = legacyOnly && !durable && row.status === "unknown" && row.user_op_hash === null;
+      if (row.direction !== "wallet_to_mb" || (row.status !== "awaiting_user_signature" && !awaitingLegacyHash)) {
         throw new BridgeError("INVALID_TRANSFER_STATUS", "Esta transferência não está aguardando assinatura.", 409);
+      }
+      if (signedPayload && now - Number(row.created_at) >= this.signatureTimeoutMs) {
+        throw new BridgeError("SIGNATURE_EXPIRED", "O prazo para assinar esta transferência terminou.", 409);
       }
       if (this.statement("SELECT id FROM transfers WHERE user_op_hash = ? OR tx_hash = ?").get(userOpHash, userOpHash)) {
         throw new BridgeError("DUPLICATE_USER_OP_HASH", "Este hash já está vinculado a outra transferência.", 409);
       }
-      this.statement("UPDATE transfers SET status = 'submitted', user_op_hash = ?, submitted_at = ?, settles_at = ? WHERE id = ? AND status = 'awaiting_user_signature'")
-        .run(userOpHash, BigInt(now), BigInt(now), transferId);
+      this.statement("UPDATE transfers SET status = ?, user_op_hash = ?, signed_payload = ?, submitted_at = ?, settles_at = ? WHERE id = ?")
+        .run(signedPayload ? "unknown" : "submitted", userOpHash, signedPayload ?? null, BigInt(now), BigInt(now), transferId);
       return this.state(accountId);
     });
   }
@@ -499,7 +542,7 @@ export class Ledger {
       if (this.reconciling || this.closed) return;
       this.reconciling = true;
       try { await this.reconcileAll(Date.now()); }
-      catch (error) { if (!this.closed) console.error("Falha na reconciliação em segundo plano", error); }
+      catch { if (!this.closed) console.error("Falha na reconciliação em segundo plano"); }
       finally { this.reconciling = false; }
     };
     this.reconcileTimer = setInterval(() => void tick(), intervalMs);
@@ -535,16 +578,19 @@ export class Ledger {
 
   private async processRow(row: Row, now: number): Promise<void> {
     const createdAt = Number(row.created_at);
+    const legacyPrivy = this.mode === "privy" && !String(row.simulation_id).startsWith(DURABLE_PENDING_PREFIX);
     if (row.status === "awaiting_user_signature") {
       if (now - createdAt >= this.signatureTimeoutMs) {
-        this.settle(row, false, `Assinatura não recebida em ${minutes(this.signatureTimeoutMs)}. O valor reservado foi devolvido.`, now, ["awaiting_user_signature"]);
+        if (legacyPrivy) this.holdLegacyTransfer(row);
+        else this.settle(row, false, `Assinatura não recebida em ${minutes(this.signatureTimeoutMs)}. O valor reservado foi devolvido.`, now, ["awaiting_user_signature"]);
       }
       return;
     }
     if (row.status === "processing" && BigInt(row.settles_at!) === PENDING_SETTLES_AT) {
-      // Envio interrompido (ex.: queda do processo durante submit) sem hash persistido.
+      // No fluxo atual, nada pode ser transmitido antes de persistir o hash.
       if (now - createdAt >= this.observationTimeoutMs) {
-        this.settle(row, false, `Envio interrompido sem hash registrado após ${minutes(this.observationTimeoutMs)}. O valor reservado foi devolvido; confira a tesouraria antes de repetir.`, now, ["processing"]);
+        if (legacyPrivy) this.holdLegacyTransfer(row);
+        else this.settle(row, false, `Envio interrompido sem hash registrado após ${minutes(this.observationTimeoutMs)}. O valor reservado foi devolvido.`, now, ["processing"]);
       }
       return;
     }
@@ -553,6 +599,12 @@ export class Ledger {
     let result;
     try {
       result = await this.provider.observe(operation, now);
+      if (result.status === "pending" && typeof row.signed_payload === "string" && this.provider.broadcast) {
+        await this.provider.broadcast(operation, row.signed_payload);
+        if (this.closed) return;
+        this.statement("UPDATE transfers SET signed_payload = NULL WHERE id = ? AND signed_payload = ?")
+          .run(operation.id, row.signed_payload);
+      }
     } catch (error) {
       if (this.closed) return;
       this.atomic(() => {
@@ -563,7 +615,7 @@ export class Ledger {
             String(row.id),
           );
       });
-      this.expireIfOverdue(row, now, "status unknown");
+      this.markObservationOverdue(row, now);
       return;
     }
     if (this.closed) return;
@@ -573,10 +625,15 @@ export class Ledger {
         this.statement("UPDATE transfers SET status = 'submitted', failure_reason = NULL, settles_at = ?, tx_hash = COALESCE(tx_hash, ?) WHERE id = ? AND status IN ('submitted', 'unknown')")
           .run(this.nextObservation(row, now), discoveredTxHash, String(row.id));
       }
-      this.expireIfOverdue(row, now, "sem receipt");
+      this.markObservationOverdue(row, now);
       return;
     }
     this.settle(row, result.status === "confirmed", result.status === "failed" ? result.reason : null, now, OBSERVABLE_STATUSES, discoveredTxHash);
+  }
+
+  private holdLegacyTransfer(row: Row): void {
+    this.statement("UPDATE transfers SET status = 'unknown', failure_reason = ?, settles_at = ? WHERE id = ? AND status = ?")
+      .run("Operação anterior à persistência de envios. A reserva permanece até a conciliação.", PENDING_SETTLES_AT, String(row.id), row.status);
   }
 
   /** Hash de transação descoberto na observação (bundle da UserOperation), validado e normalizado. */
@@ -590,12 +647,13 @@ export class Ledger {
     return submittedOnChain(row) ? BigInt(now + OBSERVATION_BACKOFF_MS) : BigInt(row.settles_at!);
   }
 
-  /** Regra explícita de expiração: só se aplica a operações com hash on-chain (tx ou UserOperation). */
-  private expireIfOverdue(row: Row, now: number, detail: string): void {
+  /** Ausência de recibo não comprova que o envio falhou. Mantém a reserva e a observação. */
+  private markObservationOverdue(row: Row, now: number): void {
     if (!submittedOnChain(row)) return;
     const since = row.submitted_at === null ? Number(row.created_at) : Number(row.submitted_at);
     if (now - since < this.observationTimeoutMs) return;
-    this.settle(row, false, `Transação não confirmada em ${minutes(this.observationTimeoutMs)} (${detail}). O valor reservado foi devolvido por expiração.`, now, ["submitted", "unknown"]);
+    this.statement("UPDATE transfers SET status = 'unknown', failure_reason = ? WHERE id = ? AND status IN ('submitted', 'unknown')")
+      .run(`Sem confirmação após ${minutes(this.observationTimeoutMs)}. A reserva permanece enquanto a rede é verificada.`, String(row.id));
   }
 
   /**
@@ -605,7 +663,7 @@ export class Ledger {
   private settle(row: Row, confirmed: boolean, reason: string | null, now: number, from: readonly TransactionStatus[], txHash: string | null = null): void {
     this.atomic(() => {
       const guard = from.map((status) => `'${status}'`).join(", ");
-      const settled = this.statement(`UPDATE transfers SET status = ?, failure_reason = ?, settled_at = ?, tx_hash = COALESCE(tx_hash, ?) WHERE id = ? AND status IN (${guard})`)
+      const settled = this.statement(`UPDATE transfers SET status = ?, failure_reason = ?, settled_at = ?, tx_hash = COALESCE(tx_hash, ?), signed_payload = NULL WHERE id = ? AND status IN (${guard})`)
         .run(confirmed ? "confirmed" : "failed", reason, BigInt(now), txHash, String(row.id));
       if (Number(settled.changes) !== 1) return;
       const outbound = row.direction === "mb_to_wallet";
@@ -744,7 +802,8 @@ export function getLedger(): Ledger {
   // shortcut: uma instância por processo; usar PostgreSQL antes de executar em múltiplas réplicas.
   if (!globalLedger.mbBridgeLedger) {
     const provider = getWalletProvider();
-    const ledger = new Ledger(process.env.MB_DATABASE_PATH || resolve("data/bridge.sqlite"), provider, ledgerOptionsFromEnv(provider.mode));
+    const defaultPath = provider.mode === "privy" ? "data/bridge-sepolia.sqlite" : "data/bridge.sqlite";
+    const ledger = new Ledger(process.env.MB_DATABASE_PATH?.trim() || resolve(defaultPath), provider, ledgerOptionsFromEnv(provider.mode));
     if (provider.mode === "privy") ledger.startReconciler(positiveInt(process.env.POC_RECONCILE_INTERVAL_MS, 5_000));
     globalLedger.mbBridgeLedger = ledger;
   }

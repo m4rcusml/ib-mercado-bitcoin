@@ -3,13 +3,14 @@ import assert from "node:assert/strict";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { encodeAbiParameters, encodeEventTopics, getAddress } from "viem";
-import { ENTRY_POINT_V06, mockUsdcAbi } from "../../src/lib/chain/index.ts";
+import { encodeAbiParameters, encodeEventTopics, encodeFunctionData, getAddress, parseAbi } from "viem";
+import { encodeTransferCall, ENTRY_POINT_V06, mockUsdcAbi, parseSignedUserOperation } from "../../src/lib/chain/index.ts";
 import type { ExpectedTransfer, UserOperationReceiptLike, VerificationResult } from "../../src/lib/chain/index.ts";
 import { Ledger } from "../../src/lib/domain/ledger.ts";
 import { BridgeError } from "../../src/lib/domain/money.ts";
 import { PrivyWalletProvider, resolveLinkedSmartAccount } from "../../src/lib/wallet/privy-wallet-provider.ts";
 import type { PrivyAuthClient } from "../../src/lib/wallet/privy-wallet-provider.ts";
+import type { PersistedOperation } from "../../src/lib/wallet/wallet-provider.ts";
 
 type Hex = `0x${string}`;
 const TOKEN = getAddress(`0x${"1".repeat(40)}`);
@@ -41,7 +42,7 @@ function fakeChain() {
   let counter = 0;
   const verdicts = new Map<string, Verdict>();
   const userOps = new Map<string, UserOpVerdict>();
-  const sendTransfer = vi.fn(async (_to: Hex, _units: bigint): Promise<Hex> => hash(++counter));
+  const prepareTransfer = vi.fn(async (_to: Hex, _units: bigint) => ({ txHash: hash(++counter), signedPayload: undefined as Hex | undefined }));
   const verify = vi.fn(async (_client: unknown, expected: ExpectedTransfer): Promise<VerificationResult> => {
     const verdict = verdicts.get(expected.txHash) ?? { status: "pending" };
     if (verdict === "throw") throw new Error("HTTP request failed. URL: https://eth-sepolia.g.alchemy.com/v2/SECRET-KEY");
@@ -52,11 +53,13 @@ function fakeChain() {
     if (verdict === "throw") throw new Error("HTTP request failed. URL: https://api.pimlico.io/v2/sepolia/rpc?apikey=SECRET-PIMLICO");
     return verdict ?? null;
   });
+  const broadcast = vi.fn<(operation: PersistedOperation, payload: string) => Promise<void>>().mockResolvedValue(undefined);
   const provider = () => new PrivyWalletProvider({
     token: TOKEN,
-    treasury: { address: TREASURY, sendTransfer },
+    treasury: { address: TREASURY, prepareTransfer },
     publicClient: {} as never,
     userOperations: { getUserOperationReceipt },
+    broadcast,
     verify,
   });
   const set = (txHash: string, verdict: Verdict) => verdicts.set(txHash.toLowerCase(), verdict);
@@ -75,7 +78,7 @@ function fakeChain() {
     });
   };
   const setUserOp = (userOpHash: Hex, verdict: UserOpVerdict) => userOps.set(userOpHash.toLowerCase(), verdict);
-  return { sendTransfer, verify, getUserOperationReceipt, provider, set, confirm, includeUserOp, setUserOp };
+  return { prepareTransfer, broadcast, verify, getUserOperationReceipt, provider, set, confirm, includeUserOp, setUserOp };
 }
 
 function login(ledger: Ledger, email: string, wallet: string | null = USER, owner: string = OWNER) {
@@ -138,7 +141,7 @@ test("mb_to_wallet: tesouraria envia, fica submitted e só credita após verific
   const { ledger, accountId, chain } = fixture();
   let state = await ledger.transfer(accountId, { direction: "mb_to_wallet", amount: "12.50" }, "send-0001", 2_000);
   const tx = state.transactions[0];
-  assert.deepEqual(chain.sendTransfer.mock.calls, [[USER, 12_500_000n]]);
+  assert.deepEqual(chain.prepareTransfer.mock.calls, [[USER, 12_500_000n]]);
   assert.equal(tx.status, "submitted");
   assert.equal(tx.txHash, hash(1));
   assert.equal(tx.hash, hash(1));
@@ -168,7 +171,7 @@ test("mb_to_wallet: tesouraria envia, fica submitted e só credita após verific
   assert.deepEqual((await ledger.advance(accountId, 60_000)).balances, state.balances);
   assert.equal(chain.verify.mock.calls.length, calls, "operação final não é observada de novo");
   const replay = await ledger.transfer(accountId, { direction: "mb_to_wallet", amount: "12.50" }, "send-0001", 70_000);
-  assert.equal(chain.sendTransfer.mock.calls.length, 1, "replay idempotente não reenvia");
+  assert.equal(chain.prepareTransfer.mock.calls.length, 1, "replay idempotente não reenvia");
   assert.equal(replay.transactions.length, 1);
 });
 
@@ -188,7 +191,7 @@ test("wallet_to_mb: awaiting_user_signature -> userOpHash -> receipt do bundler 
   assert.equal(tx.toAddress, TREASURY);
   assert.equal(state.balances.walletReserved, "40.00");
   assert.equal(state.balances.walletAvailable, "60.00");
-  assert.equal(chain.sendTransfer.mock.calls.length, 1, "somente o seed usou a tesouraria");
+  assert.equal(chain.prepareTransfer.mock.calls.length, 1, "somente o seed usou a tesouraria");
 
   await ledger.advance(accountId, 5_000);
   assert.equal(chain.getUserOperationReceipt.mock.calls.length, 0, "sem userOpHash não há observação");
@@ -385,7 +388,7 @@ test("observações concorrentes da mesma operação não duplicam verificação
   assert.equal(state.reconciliation.balanced, true);
 });
 
-test("expiração explícita: submitted sem receipt e assinatura não recebida estornam com motivo auditável", async () => {
+test("assinatura não recebida estorna, mas ausência de receipt mantém a reserva", async () => {
   const { ledger, accountId, chain } = fixture({ observationTimeoutMs: 15 * MINUTE, signatureTimeoutMs: 10 * MINUTE });
   await seedWallet(ledger, accountId, chain);
   const out = (await ledger.transfer(accountId, { direction: "mb_to_wallet", amount: "5" }, "exp-out-0001", 10_000)).transactions[0];
@@ -403,11 +406,11 @@ test("expiração explícita: submitted sem receipt e assinatura não recebida e
   chain.set(out.txHash!, "throw");
   state = await ledger.advance(accountId, 10_000 + 15 * MINUTE);
   const expiredOut = state.transactions.find((tx) => tx.id === out.id)!;
-  assert.equal(expiredOut.status, "failed");
-  assert.match(expiredOut.failureReason!, /não confirmada em 15 minutos.*expiração/);
-  assert.equal(state.balances.custodialAvailable, "9900.00");
+  assert.equal(expiredOut.status, "unknown");
+  assert.match(expiredOut.failureReason!, /Sem confirmação após 15 minutos/);
+  assert.equal(state.balances.custodialAvailable, "9895.00");
   assert.equal(state.balances.walletAvailable, "100.00");
-  assert.equal(state.balances.custodialReserved, "0.00");
+  assert.equal(state.balances.custodialReserved, "5.00");
   assert.equal(state.balances.walletReserved, "0.00");
   assert.equal(state.reconciliation.balanced, true);
 });
@@ -423,12 +426,14 @@ test("receipt confirmado no limite da expiração confirma em vez de estornar", 
 
 test("falha da tesouraria antes do hash estorna sem vazar a URL do RPC", async () => {
   const { ledger, accountId, chain } = fixture();
-  chain.sendTransfer.mockRejectedValueOnce(Object.assign(new Error("long message https://eth-sepolia.g.alchemy.com/v2/SECRET-KEY"), { shortMessage: "insufficient funds for gas" }));
+  const log = vi.spyOn(console, "error").mockImplementation(() => {});
+  chain.prepareTransfer.mockRejectedValueOnce(Object.assign(new Error("long message https://eth-sepolia.g.alchemy.com/v2/SECRET-KEY"), { shortMessage: "insufficient funds for gas" }));
   const state = await ledger.transfer(accountId, { direction: "mb_to_wallet", amount: "4" }, "gas-0001", 2_000);
   assert.equal(state.transactions[0].status, "failed");
   assert.equal(state.transactions[0].failureReason, "insufficient funds for gas");
   assert.equal(state.balances.custodialAvailable, "10000.00");
   assert.equal(state.balances.custodialReserved, "0.00");
+  assert.doesNotMatch(JSON.stringify(log.mock.calls), /SECRET-KEY/);
 });
 
 test("reinício entre submitted e confirmação retoma a operação sem duplicidade", async () => {
@@ -450,10 +455,10 @@ test("reinício entre submitted e confirmação retoma a operação sem duplicid
     ledger = new Ledger(path, chain.provider());
     assert.equal(ledger.state(first.accountId).balances.custodialReserved, "9.00");
     assert.equal(await ledger.reconcileAll(5_000), 2);
-    assert.equal(chain.sendTransfer.mock.calls.length, 0, "não reenvia após reinício");
+    assert.equal(chain.prepareTransfer.mock.calls.length, 0, "não reenvia após reinício");
     await ledger.reconcileAll(60_000);
     const replay = await ledger.transfer(first.accountId, { direction: "mb_to_wallet", amount: "9" }, "restart-out-0001", 70_000);
-    assert.equal(chain.sendTransfer.mock.calls.length, 0);
+    assert.equal(chain.prepareTransfer.mock.calls.length, 0);
     assert.equal(replay.transactions.filter((tx) => tx.status === "confirmed").length, 3);
     assert.equal(replay.balances.walletAvailable, "98.00");
     assert.equal(replay.balances.custodialAvailable, "9902.00");
@@ -465,10 +470,68 @@ test("reinício entre submitted e confirmação retoma a operação sem duplicid
   }
 });
 
+test("tesouraria persiste antes do envio, retenta a mesma transação após reinício e aguarda recibo tardio", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "mb-bridge-durable-send-"));
+  const path = join(dir, "ledger.sqlite");
+  const first = fixture({ path, observationTimeoutMs: MINUTE });
+  const txHash = hash(123);
+  const signedPayload = "0x1234";
+  first.chain.prepareTransfer.mockResolvedValueOnce({ txHash, signedPayload });
+  const queued = await first.ledger.transfer(first.accountId, { direction: "mb_to_wallet", amount: "5" }, "durable-out-0001", 2_000);
+  assert.equal(queued.transactions[0].txHash, txHash);
+  assert.equal(first.chain.broadcast.mock.calls.length, 0);
+  first.chain.broadcast.mockRejectedValueOnce(new Error("RPC sem resposta"));
+  await first.ledger.reconcileAll(2_000);
+  assert.equal(first.ledger.state(first.accountId).transactions[0].status, "unknown");
+  first.ledger.close();
+  try {
+    assert.throws(() => new Ledger(path), code("LEDGER_MODE_MISMATCH"));
+    const next = fakeChain();
+    const ledger = new Ledger(path, next.provider(), { observationTimeoutMs: MINUTE });
+    try {
+      await ledger.reconcileAll(2_000 + MINUTE);
+      assert.equal(next.broadcast.mock.calls[0][0].txHash, txHash);
+      assert.equal(next.broadcast.mock.calls[0][1], signedPayload);
+      assert.equal(ledger.state(first.accountId).balances.custodialReserved, "5.00");
+      next.confirm(txHash);
+      await ledger.reconcileAll(2_000 + 2 * MINUTE);
+      assert.equal(ledger.state(first.accountId).balances.walletAvailable, "5.00");
+      assert.equal(next.prepareTransfer.mock.calls.length, 0);
+      assert.equal(next.broadcast.mock.calls.length, 1);
+    } finally { ledger.close(); }
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test("UserOperation assinada é registrada antes do broadcast e observada sem retorno do navegador", async () => {
+  const { ledger, accountId, chain } = fixture({ signatureTimeoutMs: MINUTE });
+  await seedWallet(ledger, accountId, chain);
+  const back = (await ledger.transfer(accountId, { direction: "wallet_to_mb", amount: "6" }, "durable-back-0001", 4_000)).transactions[0];
+  const abi = parseAbi(["function execute(address target, uint256 value, bytes data)"]);
+  const raw = {
+    sender: USER, nonce: "0x0", initCode: "0x", signature: "0xaabb", paymasterAndData: "0x",
+    callGasLimit: "0x1", verificationGasLimit: "0x1", preVerificationGas: "0x1", maxFeePerGas: "0x1", maxPriorityFeePerGas: "0x1",
+    callData: encodeFunctionData({ abi, functionName: "execute", args: [TOKEN, 0n, encodeTransferCall(TREASURY, 6_000_000n)] }),
+  };
+  assert.throws(() => parseSignedUserOperation({ ...raw, callData: "0x" }, back.signatureRequest), code("INVALID_USER_OPERATION"));
+  const signed = parseSignedUserOperation(raw, back.signatureRequest);
+  assert.throws(() => ledger.submitUserOperation(accountId, back.id, signed.hash, 4_000 + MINUTE, signed.payload), code("SIGNATURE_EXPIRED"));
+  assert.throws(() => ledger.submitUserOperation(accountId, back.id, signed.hash, 4_100, undefined, true), code("SIGNED_USER_OPERATION_REQUIRED"));
+  ledger.submitUserOperation(accountId, back.id, signed.hash, 4_100, signed.payload);
+  assert.equal(chain.broadcast.mock.calls.length, 0);
+  await ledger.reconcileAll(4_000 + MINUTE);
+  assert.equal(chain.broadcast.mock.calls[0][0].userOpHash, signed.hash);
+  assert.equal(chain.broadcast.mock.calls[0][1], signed.payload);
+  chain.includeUserOp(signed.hash, 6_000_000n);
+  chain.confirm(BUNDLE_TX);
+  await ledger.reconcileAll(4_000 + 2 * MINUTE);
+  assert.equal(ledger.state(accountId).transactions[0].status, "confirmed");
+  assert.equal(ledger.state(accountId).balances.walletAvailable, "94.00");
+});
+
 test("operação interrompida antes de persistir o hash expira com estorno auditável", async () => {
   const { ledger, accountId, chain } = fixture({ observationTimeoutMs: MINUTE });
   let release!: () => void;
-  chain.sendTransfer.mockImplementationOnce(() => new Promise<Hex>((_resolve, reject) => { release = () => reject(new Error("processo caiu")); }));
+  chain.prepareTransfer.mockImplementationOnce(() => new Promise<Awaited<ReturnType<typeof chain.prepareTransfer>>>((_resolve, reject) => { release = () => reject(new Error("processo caiu")); }));
   const inFlight = ledger.transfer(accountId, { direction: "mb_to_wallet", amount: "1" }, "crash-0001", 2_000);
   await ledger.reconcileAll(2_000 + MINUTE - 1);
   assert.equal(ledger.state(accountId).transactions[0].status, "processing", "envio em curso não é tocado");
@@ -493,7 +556,7 @@ test("reconcileAll processa operações de várias contas", async () => {
   assert.equal(await ledger.reconcileAll(3_000), 2);
   assert.equal(ledger.state(accountId).balances.walletAvailable, "1.00");
   assert.equal(ledger.state(other).balances.walletAvailable, "2.00");
-  assert.deepEqual(chain.sendTransfer.mock.calls.map((call) => call[0]), [USER, OTHER_USER]);
+  assert.deepEqual(chain.prepareTransfer.mock.calls.map((call) => call[0]), [USER, OTHER_USER]);
 });
 
 test("vinculação: EOA vem do Privy, smart account é derivada no servidor e ambas são únicas por conta", async () => {
@@ -517,7 +580,7 @@ test("vinculação: EOA vem do Privy, smart account é derivada no servidor e am
   // Transferências usam a smart account (não a EOA) como origem/destino.
   const out = (await ledger.transfer(accountId, { direction: "mb_to_wallet", amount: "1" }, "link-0001", 2_000)).transactions[0];
   assert.equal(out.toAddress, USER);
-  assert.deepEqual(chain.sendTransfer.mock.calls, [[USER, 1_000_000n]]);
+  assert.deepEqual(chain.prepareTransfer.mock.calls, [[USER, 1_000_000n]]);
 
   const second = login(ledger, "segunda@example.com", null);
   assert.throws(() => ledger.linkWallet(second, USER, OTHER_OWNER), code("WALLET_ALREADY_LINKED"));

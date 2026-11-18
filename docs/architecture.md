@@ -14,7 +14,7 @@ O MB Wallet Bridge demonstra uma ponte contábil entre dois domínios de saldo d
 - **conta custodial simulada:** saldo interno persistido pelo ledger;
 - **wallet:** saldo tokenizado em uma smart account ERC-4337 na Sepolia.
 
-A transferência nunca é considerada concluída pelo simples envio de uma operação. O ledger primeiro reserva o saldo da origem, registra a operação e só liquida o crédito no destino depois de verificar no servidor a evidência on-chain: o receipt da transação da tesouraria (`mb_to_wallet`) ou o `UserOperationReceipt` do bundler seguido do receipt da transação do bundle (`wallet_to_mb`). Falha, rejeição ou expiração da observação provocam estorno integral da reserva.
+A transferência nunca é considerada concluída pelo simples envio de uma operação. O ledger primeiro reserva o saldo da origem, registra a operação e só liquida o crédito no destino depois de verificar no servidor a evidência on-chain: o receipt da transação da tesouraria (`mb_to_wallet`) ou o `UserOperationReceipt` do bundler seguido do receipt da transação do bundle (`wallet_to_mb`). Falha comprovada provoca estorno integral da reserva. Após a transmissão, a ausência de recibo mantém a reserva em observação.
 
 O sistema não integra sistemas privados do Mercado Bitcoin, ativos reais, mainnet, câmbio ou chaves exportáveis. O contrato usado é um Mock USDC de seis casas decimais, destinado somente à Sepolia.
 
@@ -60,7 +60,7 @@ O usuário paga o gas da devolução (`wallet_to_mb`): a smart account deve rece
          ▼                                  ▼
  ┌────────────────── Next.js API (servidor) ───────────────────────────────┐
  │ /api/wallet/link: token Privy → EOA → factory.getAddress → smart account │
- │ /api/transfers, /submission {userOpHash}, /reconciliation/advance       │
+ │ /api/transfers, /transfers/{id}/rpc, /reconciliation/advance       │
  │ /api/rpc: proxy → Pimlico (métodos 4337) | Alchemy (leituras)           │
  │       │                                                                  │
  │  Ledger (`src/lib/domain/ledger.ts`) ── transação SQL ── SQLite                 │
@@ -125,14 +125,13 @@ export interface WalletProvider {
 
 ```ts
 const account = await toCoinbaseSmartAccount({ client: publicClient, owners: [privyEoaLocalAccount], version: "1" });
-// publicClient e bundlerClient usam http("/api/rpc") — o proxy autenticado do servidor.
+// Use http("/api/rpc") no publicClient e http(`/api/transfers/${id}/rpc`) no bundlerClient.
 const userOpHash = await bundlerClient.sendUserOperation({
   account,
   calls: [{ to: signatureRequest.token, data: encodeFunctionData({ abi: erc20Abi, functionName: "transfer",
     args: [signatureRequest.to, BigInt(signatureRequest.amountUnits)] }) }],
   // Sem paymaster: a smart account paga o gas com ETH Sepolia próprio.
 });
-await fetch(`/api/transfers/${id}/submission`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ userOpHash }) });
 ```
 
 O componente cliente fica em `src/components/privy/`. Antes de assinar, o browser deve conferir que `account.address === signatureRequest.smartAccount`.
@@ -188,19 +187,19 @@ wallet_to_mb:  reserva ─► awaiting_user_signature ─(userOpHash)─► subm
 
 1. A API valida sessão, Sepolia, smart account vinculada, valor e `Idempotency-Key`.
 2. Em uma transação SQL: `custodial_cents -= X` e `custodial_reserved += X`; cria `transfer` em `processing` com `from = tesouraria`, `to = smartAccount`.
-3. Fora da transação SQL, a tesouraria (EOA do servidor) envia `MockUSDC.transfer(smartAccount, X * 10_000)`; o `txHash` é salvo e o status vira `submitted`.
+3. Fora da transação SQL, a tesouraria (EOA do servidor) assina `MockUSDC.transfer(smartAccount, X * 10_000)`. O servidor persiste a transação assinada e o `txHash` antes de o reconciliador transmitir.
 4. O reconciliador chama `verifyTransfer` (receipt + evento `Transfer` exatos).
 5. Se confirmado: `custodial_reserved -= X`, `wallet_cents += X`.
-6. Se falhar ou expirar: `custodial_reserved -= X`, `custodial_cents += X`; grava o motivo.
+6. Se falhar de forma comprovada: `custodial_reserved -= X`, `custodial_cents += X`; grava o motivo.
 
 ### Wallet → MB
 
 1. A API valida sessão, Sepolia, smart account vinculada, valor e `Idempotency-Key`.
 2. Em uma transação SQL: `wallet_cents -= X` e `wallet_reserved += X`; cria `transfer` em `awaiting_user_signature` com `from = smartAccount`, `to = tesouraria` e expõe `signatureRequest`.
-3. No browser, a EOA embedded assina a UserOperation da smart account com `MockUSDC.transfer(TREASURY_ADDRESS, X * 10_000)`; o bundler (via `/api/rpc`) devolve o `userOpHash`, enviado a `POST /api/transfers/{id}/submission`. Status `submitted`.
+3. No browser, a EOA embedded assina a UserOperation da smart account com `MockUSDC.transfer(TREASURY_ADDRESS, X * 10_000)`; o browser registra a operação assinada em `POST /api/transfers/{id}/rpc`. O servidor calcula e persiste o `userOpHash` e o reconciliador transmite ao bundler.
 4. O reconciliador consulta o receipt da UserOperation e valida sender, sucesso, logs da UserOperation e a transação do bundle (seção 4).
 5. Se confirmado: `wallet_reserved -= X` e `custodial_cents += X`; grava `tx_hash`.
-6. Se falhar ou expirar: `wallet_reserved -= X` e `wallet_cents += X`; grava o motivo.
+6. Se falhar de forma comprovada ou se o prazo para receber a assinatura terminar: `wallet_reserved -= X` e `wallet_cents += X`; grava o motivo.
 
 ## 7. Segurança e Restrições
 
@@ -232,7 +231,7 @@ O token de sessão deve ser armazenado com hash, ter expiração e ser invalidad
 | `MOCK_USDC_ADDRESS` | `privy` | Endereço Sepolia do Mock USDC implantado pela PoC. |
 | `TREASURY_ADDRESS` | `privy` | Endereço Sepolia que recebe tokens no fluxo wallet → MB e origina o fluxo MB → wallet. |
 | `TREASURY_PRIVATE_KEY` | `privy` | Chave da tesouraria de teste (somente servidor). |
-| `MB_DATABASE_PATH` | Opcional | Caminho SQLite. Padrão atual: `data/bridge.sqlite`. |
+| `MB_DATABASE_PATH` | Opcional | Caminho SQLite exclusivo do modo. Padrões `data/bridge.sqlite` (simulado) e `data/bridge-sepolia.sqlite` (Privy). |
 
 Exemplo de configuração local (não versionar `.env.local`):
 

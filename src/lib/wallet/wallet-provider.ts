@@ -38,7 +38,7 @@ export type SubmitResult =
   /** Modo simulado: liquidação elegível em `settlesAt`. */
   | { status: "processing"; simulationId: string; settlesAt: number; userOpHash: string | null }
   /** Envio on-chain feito pelo servidor (tesouraria); ainda não verificado. */
-  | { status: "submitted"; txHash: string }
+  | { status: "submitted"; txHash: string; signedPayload?: string }
   /** O usuário precisa assinar a UserOperation no browser e informar o `userOpHash`. */
   | { status: "awaiting_user_signature" };
 
@@ -61,6 +61,8 @@ export interface WalletProvider {
   activate(accountId: string): string | Promise<string>;
   route(direction: Direction, walletAddress: string, amountCents: bigint): TransferRoute;
   submit(operation: PersistedOperation, now: number): Promise<SubmitResult> | SubmitResult;
+  initialize?(): Promise<void>;
+  broadcast?(operation: PersistedOperation, signedPayload: string): Promise<void>;
   observe(operation: PersistedOperation, now: number): Promise<ObservationResult> | ObservationResult;
   signatureRequest(operation: PersistedOperation): SignatureRequest | null;
 }

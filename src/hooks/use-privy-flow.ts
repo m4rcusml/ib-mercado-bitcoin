@@ -18,7 +18,7 @@ interface PrivyFlowOptions {
 
 /**
  * Fluxo Privy/ERC-4337 da página: signer exposto pelo `PrivyLoader`, vinculação da wallet,
- * assinatura e registro de UserOperations (com `userOpHash` pendente guardado no localStorage)
+ * assinatura de UserOperations e recuperação de hashes de envios anteriores à persistência no servidor
  * e situação de gas/deploy da smart account.
  */
 export function usePrivyFlow({ state, privyMode, perform, setBusy, setError, setNotice }: PrivyFlowOptions) {
@@ -84,20 +84,11 @@ export function usePrivyFlow({ state, privyMode, perform, setBusy, setError, set
     else setNotice("Preparando sua embedded wallet. A vinculação continua automaticamente.");
   }
 
-  function rememberHash(id: string, hash: string | null) {
-    setPendingHashes((current) => {
-      const next = { ...current };
-      if (hash) next[id] = hash; else delete next[id];
-      writePendingHashes(next);
-      return next;
-    });
-  }
-
   async function signTransaction(raw: Transaction) {
     const tx = transactionView(raw);
     const key = `sign-${tx.id}`;
-    let userOpHash = pendingHashes[tx.id];
-    if (!userOpHash) {
+    const legacyHash = pendingHashes[tx.id];
+    if (!legacyHash) {
       const request = tx.signatureRequest;
       if (!request) { setError("O servidor ainda não enviou os dados para assinatura. Aguarde a próxima atualização."); return; }
       if (!signer?.authenticated) { setError("Conecte sua wallet Privy antes de assinar."); return; }
@@ -106,7 +97,7 @@ export function usePrivyFlow({ state, privyMode, perform, setBusy, setError, set
       if (smartAccountAddress && target.smartAccount.toLowerCase() !== smartAccountAddress.toLowerCase()) { setError("Smart account divergente do servidor. Atualize a página."); return; }
       setBusy(key); setError(""); setNotice("");
       try {
-        userOpHash = await signer.sendUserOperation(request, target);
+        await signer.sendUserOperation(tx.id, request, target);
       } catch (err) {
         const signerError = toSignerError(err);
         setError(signerError.message);
@@ -114,16 +105,15 @@ export function usePrivyFlow({ state, privyMode, perform, setBusy, setError, set
         setBusy(null);
         return;
       }
-      rememberHash(tx.id, userOpHash);
     }
-    const sentHash = userOpHash;
-    const next = await perform(key, `/api/transfers/${encodeURIComponent(tx.id)}/submission`, { userOpHash: sentHash }, { "Idempotency-Key": `submit-${sentHash}` });
+    const next = legacyHash
+      ? await perform(key, `/api/transfers/${encodeURIComponent(tx.id)}/submission`, { userOpHash: legacyHash })
+      : await perform(key, "/api/reconciliation/advance");
     if (next) {
-      rememberHash(tx.id, null);
       setAaStatusTick((value) => value + 1);
-      setNotice("UserOperation enviada ao bundler. O servidor acompanha o receipt na Sepolia; o saldo só muda após a confirmação.");
-    } else {
-      setError((message) => `${message} A UserOperation já foi enviada ao bundler (${sentHash.slice(0, 10)}…); use "Registrar envio" para tentar de novo sem assinar outra vez.`);
+      setNotice("UserOperation registrada. O servidor acompanha a transmissão e o recibo na Sepolia.");
+    } else if (!legacyHash) {
+      setError((message) => `${message} A UserOperation já foi registrada. Atualize o estado para acompanhar o envio.`);
     }
   }
 

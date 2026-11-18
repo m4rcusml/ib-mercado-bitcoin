@@ -67,7 +67,7 @@ describe.skipIf(skip)("Sepolia MB → wallet ponta a ponta (gasta gas da tesoura
 
     let state = await ledger.transfer(accountId!, { direction: "mb_to_wallet", amount: AMOUNT }, `int-${randomUUID()}`);
     expect(state.transactions).toHaveLength(1);
-    expect(state.transactions[0].status, state.transactions[0].failureReason ?? "").toBe("submitted");
+    expect(state.transactions[0].status, state.transactions[0].failureReason ?? "").toBe("unknown");
     expect(state.transactions[0].txHash).toMatch(/^0x[0-9a-f]{64}$/);
     expect(state.balances.custodialAvailable).toBe("9999.99");
     expect(state.balances.custodialReserved).toBe("0.01");

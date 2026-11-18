@@ -6,11 +6,13 @@ import { readRpcUpstreams, type RpcUpstreams } from "../../../lib/chain/index.ts
 import { getPrivyAuthClient, getSmartAccountDeriver, resolveLinkedSmartAccount } from "../../../lib/wallet/privy-wallet-provider.ts";
 import { FixedWindowRateLimiter, proxyJsonRpc, RPC_BODY_LIMIT_BYTES, rpcCallCount } from "../../../lib/server/rpc-proxy.ts";
 import { stateEventStream } from "../../../lib/server/sse.ts";
+import { parseSignedUserOperation } from "../../../lib/chain/smart-account.ts";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
 
 const SUBMISSION_PATH = /^\/api\/transfers\/([A-Za-z0-9-]{1,64})\/submission$/;
+const TRANSFER_RPC_PATH = /^\/api\/transfers\/([A-Za-z0-9-]{1,64})\/rpc$/;
 /** Chamadas JSON-RPC por conta por minuto no proxy `/api/rpc` (cada item de lote conta). */
 const RPC_LIMIT_PER_MINUTE = 240;
 const globalRpc = globalThis as typeof globalThis & { mbRpcLimiter?: FixedWindowRateLimiter };
@@ -71,13 +73,25 @@ export async function POST(request: Request): Promise<Response> {
     }
     const accountId = ledger.accountForSession(token);
     if (!accountId) throw new BridgeError("UNAUTHORIZED", "Entre na conta de demonstração para continuar.", 401);
-    if (path === "/api/rpc") {
+    const transferRpc = TRANSFER_RPC_PATH.exec(path);
+    if (path === "/api/rpc" || transferRpc) {
       if (!privy) throw new BridgeError("PRIVY_DISABLED", "O proxy JSON-RPC só está disponível com WALLET_PROVIDER=privy.", 409);
       const payload = await readJsonValue(request, RPC_BODY_LIMIT_BYTES);
       if (!rpcLimiter().take(accountId, rpcCallCount(payload))) {
         throw new BridgeError("RATE_LIMITED", "Muitas chamadas ao proxy JSON-RPC. Aguarde alguns segundos.", 429);
       }
-      return responseJson(await proxyJsonRpc(payload, { smartAccount: ledger.linkedSmartAccount(accountId), upstreams: rpcUpstreams() }));
+      return responseJson(await proxyJsonRpc(payload, {
+        smartAccount: ledger.linkedSmartAccount(accountId),
+        upstreams: rpcUpstreams(),
+        queueUserOperation: transferRpc ? (raw) => {
+          const transferId = transferRpc[1];
+          const transfer = ledger.state(accountId).transactions.find(({ id }) => id === transferId);
+          const signed = parseSignedUserOperation(raw, transfer?.signatureRequest, transfer?.userOpHash);
+          ledger.submitUserOperation(accountId, transferId, signed.hash, Date.now(), signed.payload);
+          ledger.notifyChange(accountId);
+          return signed.hash;
+        } : undefined,
+      }));
     }
     // Demais rotas autenticadas alteram o estado: avisa as conexões SSE da conta (outras abas).
     const response = await handleAccountAction(request, path, ledger, accountId, privy);
@@ -107,7 +121,7 @@ async function handleAccountAction(request: Request, path: string, ledger: Retur
     const submission = SUBMISSION_PATH.exec(path);
     if (submission) {
       const body = await readJson(request);
-      return responseJson(ledger.submitUserOperation(accountId, submission[1], body.userOpHash));
+      return responseJson(ledger.submitUserOperation(accountId, submission[1], body.userOpHash, Date.now(), undefined, true));
     }
     // Retenta operações pendentes (inclusive `unknown`) sem liberar reserva sem evidência.
     if (path === "/api/reconciliation/advance") return responseJson(await ledger.advance(accountId));

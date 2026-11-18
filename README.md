@@ -20,7 +20,7 @@ npm run dev
 
 Abra [http://127.0.0.1:3000](http://127.0.0.1:3000). Informe um e-mail de demonstração, solicite o código e entre com **123456**. O desafio expira em dez minutos e é consumido no login; para entrar novamente, solicite outro. Nenhum e-mail é enviado.
 
-O SQLite é criado automaticamente em `data/bridge.sqlite`. Os dados persistem ao reiniciar a aplicação. A configuração é opcional; consulte [`.env.example`](.env.example) e, se necessário, copie para `.env.local` para alterar `MB_DATABASE_PATH`.
+O SQLite é criado automaticamente em `data/bridge.sqlite` no modo simulado e em `data/bridge-sepolia.sqlite` no modo Privy. Os dados persistem ao reiniciar a aplicação. A configuração é opcional; consulte [`.env.example`](.env.example) e, se necessário, copie para `.env.local` para alterar `MB_DATABASE_PATH`. Use um arquivo exclusivo por modo.
 
 ## Configuração da PoC Sepolia
 
@@ -40,15 +40,15 @@ A conta operacional do usuário é uma **Coinbase Smart Account** (ERC-4337, Ent
 
 ```text
 EOA Privy (assina o userOpHash) ─► Coinbase Smart Account (sender) ─► UserOperation
-  ─► POST /api/rpc (proxy autenticado) ─► bundler Pimlico ─► EntryPoint v0.6 ─► MockUSDC.transfer(tesouraria)
+  ─► POST /api/transfers/{id}/rpc ─► SQLite ─► worker ─► Pimlico ─► EntryPoint v0.6
 ```
 
 1. Entre com o e-mail de demonstração e use **Conectar wallet**. A Privy autentica e cria ou recupera a EOA embedded; a interface envia apenas o access token para `POST /api/wallet/link`. O servidor deriva o endereço contrafactual da smart account (sem deploy, sem gas) e o exibe como **Smart account (ERC-4337)**; a EOA aparece menor, como **Assinante (EOA Privy)**.
 2. **Financie a smart account, não a EOA.** Copie o endereço da smart account na interface e envie ETH Sepolia de um faucet para ele. Sem saldo, a interface bloqueia a assinatura e mostra o aviso "A smart account precisa de ETH Sepolia para pagar o gas". A primeira UserOperation também implanta a conta (`initCode`) e por isso custa mais gas que as seguintes.
-3. Para **wallet → conta MB**, crie a transferência e use **Assinar no navegador**. O navegador monta a smart account com a EOA Privy como dona, confere que os endereços da EOA e da smart account são os mesmos vinculados no servidor (senão recusa com "Smart account divergente do servidor"), estima o gas pelo bundler e envia `MockUSDC.transfer(tesouraria, valor)` como UserOperation. O `userOpHash` é enviado imediatamente a `POST /api/transfers/{id}/submission` (`{ "userOpHash": "0x…" }`) e fica guardado no navegador até ser registrado, para nunca pedir uma segunda assinatura (**Registrar envio**). O navegador não espera o receipt: quem observa e valida é o servidor.
+3. Para **wallet → conta MB**, crie a transferência e use **Assinar no navegador**. A EOA Privy assina a UserOperation da smart account vinculada. O servidor persiste a operação assinada e seu hash antes de transmiti-la ao bundler e acompanha o recibo.
 4. Os estados exibidos são *Aguardando assinatura*, *UserOperation enviada — aguardando bundler/Sepolia*, *Indeterminada — reconsultando*, *Confirmada* e *Falhou*, com link para o explorador quando existir. Um worker no servidor reconcilia as pendências e a interface recebe cada mudança por **SSE** (`GET /api/events`), voltando ao polling só se a conexão cair. A interface nunca marca uma transferência como confirmada por conta própria.
 
-Todas as chamadas de RPC e bundler do navegador passam por `POST /api/rpc`, um proxy JSON-RPC same-origin autenticado pelo cookie de sessão e restrito a métodos de leitura e de bundler. A `PIMLICO_API_KEY` (obtida em [dashboard.pimlico.io](https://dashboard.pimlico.io)) e a URL do RPC ficam **somente no servidor**; nunca use `NEXT_PUBLIC_` para elas.
+O proxy JSON-RPC exige uma sessão autenticada. Use `POST /api/rpc` para consultas e `POST /api/transfers/{id}/rpc` para registrar uma UserOperation assinada. A `PIMLICO_API_KEY` (obtida em [dashboard.pimlico.io](https://dashboard.pimlico.io)) e a URL do RPC ficam **somente no servidor**; nunca use `NEXT_PUBLIC_` para elas.
 
 ## Roteiro para a equipe
 

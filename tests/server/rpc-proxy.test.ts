@@ -60,9 +60,16 @@ test("requests malformados respondem -32600/-32602", async () => {
 test("eth_sendUserOperation/estimate exigem sender = smart account da sessão e EntryPoint v0.6", async () => {
   for (const method of ["eth_sendUserOperation", "eth_estimateUserOperationGas"]) {
     const ok = context({ jsonrpc: "2.0", id: 1, result: `0x${"11".repeat(32)}` });
+    const queue = vi.fn(() => `0x${"11".repeat(32)}`);
+    if (method === "eth_sendUserOperation") ok.ctx.queueUserOperation = queue;
     const response = await proxyJsonRpc(call(method, [userOp(SMART.toLowerCase()), ENTRY_POINT_V06.toLowerCase()]), ok.ctx);
     assert.ok("result" in response, method);
-    assert.equal(ok.fetch.mock.calls[0][0], upstreams.bundlerUrl);
+    if (method === "eth_sendUserOperation") {
+      assert.deepEqual(queue.mock.calls, [[userOp(SMART.toLowerCase())]]);
+      assert.equal(ok.fetch.mock.calls.length, 0);
+    } else {
+      assert.equal(ok.fetch.mock.calls[0][0], upstreams.bundlerUrl);
+    }
 
     const cases: Array<[RpcProxyContext["smartAccount"], unknown[]]> = [
       [SMART, [userOp(OTHER), ENTRY_POINT_V06]],
@@ -80,6 +87,13 @@ test("eth_sendUserOperation/estimate exigem sender = smart account da sessão e 
       assert.equal(fetch.mock.calls.length, 0, "não chega ao bundler");
     }
   }
+});
+
+test("proxy geral não transmite operações fora do fluxo persistente", async () => {
+  const { ctx, fetch } = context();
+  const response = await proxyJsonRpc(call("eth_sendUserOperation", [userOp(SMART), ENTRY_POINT_V06]), ctx);
+  assert.ok("error" in response && response.error.code === -32602);
+  assert.equal(fetch.mock.calls.length, 0);
 });
 
 test("lote: cada item é validado e roteado individualmente", async () => {

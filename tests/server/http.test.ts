@@ -155,7 +155,10 @@ test("POST /api/rpc no modo privy: roteia, confere sender da smart account vincu
     assert.equal(foreign.json.error.data.code, "SMART_ACCOUNT_MISMATCH");
     assert.equal(fetchMock.mock.calls.length, calls);
     const own = await call("/api/rpc", userOp(SMART), cookie);
-    assert.ok("result" in own.json);
+    assert.equal(own.json.error.code, -32602);
+    assert.equal(fetchMock.mock.calls.length, calls);
+    const estimate = await call("/api/rpc", { ...userOp(SMART), method: "eth_estimateUserOperationGas" }, cookie);
+    assert.ok("result" in estimate.json);
     assert.equal(String(fetchMock.mock.calls.at(-1)![0]), "https://api.pimlico.io/v2/sepolia/rpc?apikey=pim_PIMLICO_SECRET_KEY");
 
     const batch = await call("/api/rpc", [{ jsonrpc: "2.0", id: 1, method: "eth_blockNumber" }, { jsonrpc: "2.0", id: 2, method: "debug_traceCall" }], cookie);

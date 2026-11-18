@@ -2,6 +2,7 @@
 // As URLs upstream contêm chaves de API e nunca são devolvidas ao cliente nem registradas.
 import { isAddress, isAddressEqual } from "viem";
 import { ENTRY_POINT_V06, type RpcUpstreams } from "../chain/index.ts";
+import { BridgeError } from "../domain/money.ts";
 
 /** Métodos ERC-4337 encaminhados ao bundler Pimlico (Sepolia). */
 export const BUNDLER_METHODS: ReadonlySet<string> = new Set([
@@ -52,6 +53,7 @@ export interface RpcProxyContext {
   /** Smart account vinculada à sessão; `null` se a conta ainda não vinculou a wallet. */
   smartAccount: string | null;
   upstreams: RpcUpstreams;
+  queueUserOperation?: (operation: unknown) => string;
   /** Injetável em testes. */
   fetch?: typeof fetch;
 }
@@ -106,6 +108,15 @@ async function proxySingle(item: unknown, ctx: RpcProxyContext): Promise<JsonRpc
     const rejection = checkUserOperation(params, ctx.smartAccount);
     // `data.code` (e o prefixo da mensagem) permitem ao cliente mapear o erro sem depender do texto.
     if (rejection) return failure(id, -32602, `SMART_ACCOUNT_MISMATCH: ${rejection}`, { code: "SMART_ACCOUNT_MISMATCH" });
+  }
+  if (method === "eth_sendUserOperation") {
+    if (!ctx.queueUserOperation) return failure(id, -32602, "Use o endpoint RPC da transferência para enviar a UserOperation.");
+    try {
+      return { jsonrpc: "2.0", id, result: ctx.queueUserOperation(params[0]) };
+    } catch (error) {
+      if (error instanceof BridgeError) return failure(id, -32602, error.message, { code: error.code });
+      throw error;
+    }
   }
 
   return forward(bundler ? ctx.upstreams.bundlerUrl : ctx.upstreams.rpcUrl, id, method, params, ctx.fetch ?? fetch);

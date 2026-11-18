@@ -58,6 +58,6 @@ export function responseJson(value: unknown, status = 200, headers?: HeadersInit
 
 export function errorResponse(error: unknown): Response {
   if (error instanceof BridgeError) return responseJson({ error: { code: error.code, message: error.message } }, error.status);
-  console.error("Erro interno do simulador", error);
+  console.error("Erro interno do simulador");
   return responseJson({ error: { code: "INTERNAL_ERROR", message: "Não foi possível concluir a operação. Tente novamente." } }, 500);
 }

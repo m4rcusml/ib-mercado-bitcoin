@@ -3,17 +3,23 @@
 import {
   createPublicClient,
   createWalletClient,
+  encodeFunctionData,
   http,
   isAddress,
   isAddressEqual,
+  keccak256,
+  type Hex,
   type PublicClient,
 } from "viem";
-import { createBundlerClient } from "viem/account-abstraction";
+import { createBundlerClient, type RpcUserOperation } from "viem/account-abstraction";
 import { privateKeyToAccount } from "viem/accounts";
 import { sepolia } from "viem/chains";
 import type { ReceiptReader } from "./receipt-verifier.ts";
-import { createUserOperationReader, type UserOperationReader } from "./smart-account.ts";
+import { createUserOperationReader, ENTRY_POINT_V06, type UserOperationReader } from "./smart-account.ts";
 import { createTreasurySender, type TreasurySender } from "./treasury-sender.ts";
+import { mockUsdcAbi, MOCK_USDC_DECIMALS } from "./mock-usdc.ts";
+import { BridgeError } from "../domain/money.ts";
+import type { PersistedOperation } from "../wallet/wallet-provider.ts";
 
 export interface SepoliaConfig {
   rpcUrl: string;
@@ -119,8 +125,10 @@ export function createSepoliaClients(cfg: SepoliaConfig): {
   publicClient: ReceiptReader & PublicClient;
   treasury: TreasurySender;
   userOperations: UserOperationReader;
+  initialize(): Promise<void>;
+  broadcast(operation: PersistedOperation, signedPayload: string): Promise<void>;
 } {
-  const transport = http(cfg.rpcUrl);
+  const transport = http(cfg.rpcUrl, { retryCount: 0 });
   const publicClient = createPublicClient({ chain: sepolia, transport });
   const account = privateKeyToAccount(cfg.treasuryPrivateKey);
   const walletClient = createWalletClient({ account, chain: sepolia, transport });
@@ -129,26 +137,68 @@ export function createSepoliaClients(cfg: SepoliaConfig): {
     token: cfg.token,
     walletClient: {
       account,
-      writeContract: (args) =>
-        walletClient.writeContract({
-          address: args.address,
-          abi: args.abi,
-          functionName: "transfer",
-          args: [args.args[0], args.args[1]],
-          account,
-          chain: sepolia,
-        }),
+      async signTransfer(args) {
+        await initialize();
+        const simulation = await publicClient.simulateContract({ ...args, account });
+        if (!simulation.result) throw new BridgeError("TREASURY_TRANSFER_REJECTED", "O contrato recusou a transferência da tesouraria.", 409);
+        const request = await walletClient.prepareTransactionRequest({
+          to: args.address,
+          data: encodeFunctionData(args),
+          type: "eip1559",
+        });
+        const signedPayload = await account.signTransaction({ ...request, chainId: sepolia.id });
+        return { txHash: keccak256(signedPayload), signedPayload };
+      },
     },
   });
 
   const bundlerClient = createBundlerClient({
     client: publicClient,
     chain: sepolia,
-    transport: http(pimlicoBundlerUrl(cfg.pimlicoApiKey)),
+    transport: http(pimlicoBundlerUrl(cfg.pimlicoApiKey), { retryCount: 0 }),
   });
   const userOperations = createUserOperationReader({
     getUserOperationReceipt: (args) => bundlerClient.getUserOperationReceipt(args),
   });
 
-  return { publicClient: publicClient as ReceiptReader & PublicClient, treasury, userOperations };
+  let validation: Promise<void> | undefined;
+  function initialize() {
+    validation ??= validateSepolia(publicClient, cfg.token).catch((error) => {
+      validation = undefined;
+      throw error;
+    });
+    return validation;
+  }
+
+  return {
+    publicClient: publicClient as ReceiptReader & PublicClient,
+    treasury,
+    userOperations,
+    initialize,
+    async broadcast(operation, signedPayload) {
+      await initialize();
+      if (operation.direction === "mb_to_wallet") {
+        const hash = await publicClient.sendRawTransaction({ serializedTransaction: signedPayload as Hex });
+        if (hash.toLowerCase() !== operation.txHash) throw new Error("O RPC retornou um hash diferente da transação assinada.");
+      } else {
+        const userOperation = JSON.parse(signedPayload) as RpcUserOperation<"0.6">;
+        const hash = await bundlerClient.request({ method: "eth_sendUserOperation", params: [userOperation, ENTRY_POINT_V06] });
+        if (hash.toLowerCase() !== operation.userOpHash) throw new Error("O bundler retornou um hash diferente da UserOperation assinada.");
+      }
+    },
+  };
+}
+
+export async function validateSepolia(client: Pick<PublicClient, "getChainId" | "getCode" | "readContract">, token: Hex): Promise<void> {
+  try {
+    const [chainId, code, decimals] = await Promise.all([
+      client.getChainId(),
+      client.getCode({ address: token }),
+      client.readContract({ address: token, abi: mockUsdcAbi, functionName: "decimals" }),
+    ]);
+    if (chainId === sepolia.id && code && code !== "0x" && decimals === MOCK_USDC_DECIMALS) return;
+  } catch {
+    throw new BridgeError("SEPOLIA_UNAVAILABLE", "Falha ao verificar a rede e o contrato Mock USDC.", 503);
+  }
+  throw new BridgeError("INVALID_SEPOLIA_CONFIG", "Verifique a rede Sepolia, o bytecode do Mock USDC e as seis casas decimais.", 503);
 }
